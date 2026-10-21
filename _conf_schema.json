@@ -8,8 +8,8 @@
   "admin_users": {
     "description": "插件管理员列表（QQ号等）",
     "type": "list",
-    "hint": "拥有管理权限的用户可执行状态/手动刷新操作。",
-    "default": null
+    "hint": "拥有管理权限的用户可执行状态/手动刷新操作。留空则只有平台管理员可用。",
+    "default": []
   },
   "target_sessions": {
     "description": "推送会话列表",

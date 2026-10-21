@@ -9,10 +9,22 @@ from .core.log_utils import sanitize
 
 BACKOFF_SECONDS = (30, 60, 300)
 
+# 服务连续稳定运行超过这个时长后，下一次崩溃的退避从 30s 重新算起。
+STABLE_RUN_SECONDS = 300
+
+DISABLED_NOTICE = (
+    "ℹ️ 插件已在配置中禁用（enabled=false），定时任务不会启动；"
+    "如需推送请先在 WebUI 打开 enabled。"
+)
+
 REFRESH_STATUS_LABELS = {
     "unchanged": "目录版本未变，无新增",
     "seeded": "已建立基线，本轮不推送",
     "no_targets": "未配置推送会话，仅更新基线",
+}
+
+REFRESH_ERROR_LABELS = {
+    "service_not_ready": "服务尚未就绪（可能仍在启动或重启），请稍后重试",
 }
 
 
@@ -41,17 +53,24 @@ class CVEWarningPlugin(Star):
 
     async def _supervisor(self) -> None:
         """跑服务直到收到停止指令，中途崩溃按 30s → 60s → 300s 退避重启。"""
+        loop = asyncio.get_running_loop()
         failures = 0
         while not self._stopping:
-            self.service = CVEWarningService(config=dict(self.config), context=self.context)
             delay = 0
+            started_at = loop.time()
             try:
+                # 构造也必须在 try 里：配置被手改成非数字时 __init__ 的 int() 会抛
+                # ValueError，写在外面会让 supervisor 协程静默结束、永不重启。
+                self.service = CVEWarningService(
+                    config=dict(self.config), context=self.context
+                )
                 await self.service.start()
                 if not self._stopping:
                     # start() 只在收到停止或前置条件不满足时正常返回；没收到停止指令
                     # 就退出属于异常，同样退避，否则 while 会紧凑空转刷日志。
-                    delay = self._backoff_seconds(failures)
-                    failures += 1
+                    failures, delay = self._schedule_restart(
+                        failures, loop.time() - started_at
+                    )
                     logger.warning(
                         f"[CVE漏洞推送] 服务在未收到停止指令的情况下退出，"
                         f"{delay}s 后重启（第 {failures} 次）"
@@ -60,8 +79,9 @@ class CVEWarningPlugin(Star):
                 self._stopping = True
                 break
             except Exception as e:
-                delay = self._backoff_seconds(failures)
-                failures += 1
+                failures, delay = self._schedule_restart(
+                    failures, loop.time() - started_at
+                )
                 logger.error(
                     f"[CVE漏洞推送] 服务异常退出，{delay}s 后重启（第 {failures} 次）: "
                     f"{sanitize(e)}"
@@ -79,15 +99,33 @@ class CVEWarningPlugin(Star):
     def _backoff_seconds(failures: int) -> int:
         return BACKOFF_SECONDS[min(failures, len(BACKOFF_SECONDS) - 1)]
 
+    @classmethod
+    def _schedule_restart(cls, failures: int, elapsed: float) -> tuple[int, int]:
+        """给出本次重启的等待秒数，以及更新后的连续失败计数。
+
+        重置策略：服务若已连续稳定运行超过 STABLE_RUN_SECONDS，先把失败计数清零，
+        再按第 1 次失败算退避。否则跑了几天的服务偶然崩一次，第一轮就要白等 300s。
+        崩溃（elapsed 很小）时计数照常累加，30s → 60s → 300s 封顶。
+        """
+        if elapsed >= STABLE_RUN_SECONDS and failures:
+            logger.info(
+                f"[CVE漏洞推送] 服务已稳定运行 {int(elapsed)}s，重启退避计数清零"
+            )
+            failures = 0
+        return failures + 1, cls._backoff_seconds(failures)
+
     async def _stop_service(self) -> None:
         service = self.service
-        self.service = None
         if service is None:
             return
         try:
             await service.stop()
         except Exception as e:
             logger.error(f"[CVE漏洞推送] 停止服务时出错: {sanitize(e)}")
+        # stop() 走完（或被取消）之后再清引用：await 被取消时保留引用，
+        # terminate() 末尾的第二次 _stop_service() 才能真的把 session 收掉。
+        if self.service is service:
+            self.service = None
 
     async def terminate(self) -> None:
         logger.info("[CVE漏洞推送] 正在停止服务...")
@@ -127,7 +165,7 @@ class CVEWarningPlugin(Star):
 
 ⚙️ 重要说明：
 • 首次启动只建立基线，不推送任何历史漏洞；之后只推真正新加入 KEV 的条目
-• 目录版本未变时不做解析、不查 NVD，几乎零开销
+• 目录版本未变时不再逐条解析条目、不查 NVD（服务端支持 ETag 时连响应体都不下载）
 • 推送会话在 WebUI 的 target_sessions 里填，格式 平台:消息类型:会话ID，
   在目标群发 /sid 指令可获取
 • 一轮新增会合并成一条消息；中文摘要依赖 AstrBot 已配置的聊天模型，
@@ -139,6 +177,9 @@ class CVEWarningPlugin(Star):
     async def cve_status(self, event: AstrMessageEvent):
         if not await self.is_plugin_admin(event):
             yield event.plain_result("🚫 权限不足：此命令仅限管理员使用。")
+            return
+        if not self.config.get("enabled", True):
+            yield event.plain_result(DISABLED_NOTICE)
             return
         if not self.service:
             yield event.plain_result("❌ 服务未启动（或正在重启）")
@@ -158,6 +199,9 @@ class CVEWarningPlugin(Star):
         if not await self.is_plugin_admin(event):
             yield event.plain_result("🚫 权限不足：此命令仅限管理员使用。")
             return
+        if not self.config.get("enabled", True):
+            yield event.plain_result(DISABLED_NOTICE)
+            return
         if not self.service:
             yield event.plain_result("❌ 服务未启动（或正在重启）")
             return
@@ -170,7 +214,8 @@ class CVEWarningPlugin(Star):
             return
 
         if not result.ok:
-            yield event.plain_result(f"❌ 手动刷新失败：{result.error}")
+            error_text = REFRESH_ERROR_LABELS.get(result.error or "", result.error)
+            yield event.plain_result(f"❌ 手动刷新失败：{error_text}")
             return
 
         yield event.plain_result(self._format_refresh_result(result))
@@ -188,6 +233,9 @@ class CVEWarningPlugin(Star):
         )
         persistent = status.get("persistent")
         ai_outcome = status.get("ai_last_outcome")
+        # 展示服务实际生效的间隔（服务会把配置值 clamp 到 1–48），不展示配置原值。
+        interval_hours = getattr(self.service, "interval_hours", None)
+        interval_text = f"{interval_hours} 小时" if isinstance(interval_hours, int) else "未知"
         lines = [
             "📊 CVE漏洞推送状态",
             f"🟢 running: {status.get('running')}",
@@ -197,7 +245,7 @@ class CVEWarningPlugin(Star):
             f"⏰ 上次拉取: {status.get('last_fetch_at_iso')}",
             f"📣 上次推送: {status.get('last_push_at_iso')}",
             f"⏭️ 下次运行: {status.get('next_run_at')}",
-            f"🕒 拉取间隔: {self.config.get('push_interval_hours', 6)} 小时",
+            f"🕒 拉取间隔: {interval_text}",
             f"📮 待补发会话与尝试次数: {pending_text}",
             f"⚠️ 上轮适配器报错会话数: {status.get('last_failed_sessions')}",
             f"🗑️ 累计放弃补发次数（按会话×轮次计）: {status.get('abandoned_total')}",
@@ -221,26 +269,31 @@ class CVEWarningPlugin(Star):
             )
 
         if result.status == "pushed":
-            if result.new_count > 0:
-                summary = f"已推送新增 {result.new_count} 条"
-            elif result.failed_sessions > 0:
-                summary = "本轮无新增，补发此前未送达的内容时仍有会话报错"
-            else:
-                summary = "本轮无新增，只补发了此前未送达的内容"
             if result.failed_sessions > 0:
-                headline = (
-                    f"⚠️ 手动刷新完成：{summary}；{result.failed_sessions} 个会话适配器报错，"
-                    f"内容已留在各自的待补发队列，下一轮重试"
-                )
+                # 有会话没发出去时不能写"已推送"：用户会以为全都送达了。
+                if result.new_count > 0:
+                    headline = (
+                        f"⚠️ 手动刷新完成：本轮新增 {result.new_count} 条"
+                        f"（其中 {result.failed_sessions} 个会话适配器报错，将进入补发队列）"
+                    )
+                else:
+                    headline = (
+                        f"⚠️ 手动刷新完成：本轮无新增，且 {result.failed_sessions} 个会话适配器"
+                        f"补发时仍然报错，内容继续留在待补发队列，下一轮重试"
+                    )
+            elif result.new_count > 0:
+                headline = f"✅ 手动刷新完成：已推送新增 {result.new_count} 条"
             else:
-                headline = f"✅ 手动刷新完成：{summary}"
+                headline = "✅ 手动刷新完成：本轮无新增，只补发了此前未送达的内容"
         else:
             label = REFRESH_STATUS_LABELS.get(result.status, result.status)
             headline = f"✅ 手动刷新完成：{label}"
 
+        # 304 与"仅补发"轮次不会设置 catalog_version，别把 None 抛给用户。
+        version_text = result.catalog_version or "未变（沿用上一轮）"
         return (
             f"{headline}\n"
-            f"目录版本: {result.catalog_version}\n"
+            f"目录版本: {version_text}\n"
             f"新增: {result.new_count} 条\n"
             f"适配器报错会话数: {result.failed_sessions}\n"
             f"放弃补发次数: {result.abandoned}"
