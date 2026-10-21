@@ -1,2 +1,7 @@
+# 开发过程产物，不进发布包
 .superpowers/
+docs/superpowers/
+
+# Python 字节码
 __pycache__/
+*.py[cod]
