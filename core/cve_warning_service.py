@@ -181,25 +181,33 @@ class CVEWarningService:
                 return result
 
     async def _refresh_locked(self, result: RefreshResult) -> RefreshResult:
-        self._drop_zombie_pending()
+        await self._drop_zombie_pending()
 
         catalog, etag = await self._fetch_with_retry()
         self._state.touch_fetch()
 
         if catalog is None:
-            logger.info("[CVE漏洞推送] KEV 目录未修改（304），本轮无操作")
-            await self._state.save()
-            return self._record_cycle(result)
+            if not self._has_pending_for_targets():
+                logger.info("[CVE漏洞推送] KEV 目录未修改（304），本轮无操作")
+                await self._state.save()
+                return self._record_cycle(result)
+            logger.info("[CVE漏洞推送] KEV 目录未修改（304），本轮只补发待补发内容")
+            return await self._deliver(result, [], None, None)
 
         version_raw = catalog.get("catalogVersion")
         version = version_raw if isinstance(version_raw, str) and version_raw.strip() else None
         result.catalog_version = version
 
         if version and version == self._state.catalog_version:
-            self._state.etag = etag or self._state.etag
-            await self._state.save()
-            logger.info(f"[CVE漏洞推送] catalogVersion 未变（{version}），本轮无操作")
-            return self._record_cycle(result)
+            if not self._has_pending_for_targets():
+                self._state.etag = etag or self._state.etag
+                await self._state.save()
+                logger.info(f"[CVE漏洞推送] catalogVersion 未变（{version}），本轮无操作")
+                return self._record_cycle(result)
+            logger.info(
+                f"[CVE漏洞推送] catalogVersion 未变（{version}），本轮只补发待补发内容"
+            )
+            return await self._deliver(result, [], None, etag)
 
         entries = [e for e in (catalog.get("vulnerabilities") or []) if isinstance(e, dict)]
 
@@ -259,6 +267,23 @@ class CVEWarningService:
                     )
                 )
 
+        return await self._deliver(result, new_blocks, version, etag, new_entries)
+
+    # --------------------------------------------------------------- 发送
+
+    async def _deliver(
+        self,
+        result: RefreshResult,
+        new_blocks: list[dict[str, Any]],
+        version: str | None,
+        etag: str | None,
+        new_entries: list[dict[str, Any]] | None = None,
+    ) -> RefreshResult:
+        """按会话发送（本轮新块 + 各自待补发块），然后收尾。
+
+        304 轮与 catalogVersion 未变轮用 new_blocks=[] 走这里，只补发而不推进版本；
+        无论各会话发送成败，本轮 new_entries 都会并入基线，并落盘一次。
+        """
         sent_any = False
         for session in self.target_sessions:
             blocks = self._merge_blocks(self._state.get_pending_blocks(session), new_blocks)
@@ -292,8 +317,6 @@ class CVEWarningService:
         await self._state.save()
         result.status = "pushed"
         return self._record_cycle(result)
-
-    # --------------------------------------------------------------- 发送
 
     @staticmethod
     def _merge_blocks(
@@ -358,13 +381,16 @@ class CVEWarningService:
         """只看目标会话是否还有待补发，避免僵尸会话把这一轮当成"有事可做"。"""
         return any(self._state.get_pending_blocks(session) for session in self.target_sessions)
 
-    def _drop_zombie_pending(self) -> None:
+    async def _drop_zombie_pending(self) -> None:
         """丢弃已不在 target_sessions 里的会话的待补发条目。
 
         发送循环只遍历目标会话，这些条目永远不会被重试或清理；留着既让状态里的
         待补发显示失真，也会在该会话被加回配置时把很久以前的内容整批推出去。
         目标集合为空时跳过：那是"配置缺失/被清空"，不是"会话被删掉"，整批丢弃
         会让用户重新配好会话后内容已经没了。
+
+        本方法在抓取之前执行，一旦抓取失败就轮不到本轮收尾的 save，所以真的丢了
+        条目时立即落盘，避免重启后再清一次、多打一条 warning。
         """
         if not self.target_sessions:
             if self._state.pending_by_session:
@@ -375,15 +401,19 @@ class CVEWarningService:
             return
 
         targets = set(self.target_sessions)
+        dropped_any = False
         for session in list(self._state.pending_by_session):
             if session in targets:
                 continue
             dropped = len(self._state.get_pending_blocks(session))
             self._state.pending_by_session.pop(session, None)
+            dropped_any = True
             logger.warning(
                 f"[CVE漏洞推送] session={session} 已不在 target_sessions 中，"
                 f"丢弃其 {dropped} 条待补发内容"
             )
+        if dropped_any:
+            await self._state.save()
 
     @staticmethod
     def _catalog_anomaly(catalog: dict[str, Any], entries: list[dict[str, Any]]) -> str | None:
