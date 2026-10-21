@@ -38,10 +38,15 @@ class JsonStateStore:
         self.state_file_path = ""
 
         try:
-            self.storage_dir = str(StarTools.get_data_dir(plugin_name))
+            data_dir = StarTools.get_data_dir(plugin_name)
+            if not data_dir or not str(data_dir).strip():
+                raise RuntimeError("StarTools.get_data_dir returned empty path")
+            self.storage_dir = str(data_dir)
             self.state_file_path = os.path.join(self.storage_dir, state_file_name)
         except Exception as e:
             self._persistent = False
+            self.storage_dir = ""
+            self.state_file_path = ""
             logger.warning(
                 f"[CVE漏洞推送] 状态目录不可用，本次运行不落盘（不会写到任何其他位置）: {sanitize(e)}"
             )
@@ -78,6 +83,8 @@ class JsonStateStore:
 
             if data.get("schema_version") != SCHEMA_VERSION:
                 self._migrate_from_v1(data)
+                self._drop_expired_cvss()
+                self._prune_cvss_cache()
                 try:
                     await asyncio.to_thread(self._backup_v1_file)
                 except Exception as e:
@@ -86,10 +93,10 @@ class JsonStateStore:
                     await asyncio.to_thread(self._write_json_atomic, self._snapshot())
                     logger.info(
                         f"[CVE漏洞推送] 状态已迁移到 v2：基线 {len(self.baseline_cves)} 条，"
-                        f"负缓存条目已清理"
+                        f"CVSS 缓存 {len(self.cvss_cache)} 条（负缓存与过期条目已清理）"
                     )
                 except Exception as e:
-                    logger.error(f"[CVE漏洞推送] 迁移后写入失败: {sanitize(e)}")
+                    self._degrade_on_write_failure("迁移写入", e)
                 return
 
             self._load_v2(data)
@@ -107,9 +114,13 @@ class JsonStateStore:
 
     def _migrate_from_v1(self, data: dict[str, Any]) -> None:
         self.baseline_cves = {}
-        pushed = data.get("pushed_at_by_cve")
-        if isinstance(pushed, dict):
-            for cve_id in pushed:
+        # 基线取三本"见过"账的并集：v1 里被严重度过滤挡下的条目只进了 seen/suppressed，
+        # 只按 pushed_at_by_cve 播种会让升级后的第一轮把它们全当新增（升级版首装洪水）。
+        for field in ("pushed_at_by_cve", "seen_at_by_cve", "suppressed_at_by_cve"):
+            bucket = data.get(field)
+            if not isinstance(bucket, dict):
+                continue
+            for cve_id in bucket:
                 if isinstance(cve_id, str) and cve_id.strip():
                     self.baseline_cves[cve_id.strip()] = ""
 
@@ -123,12 +134,9 @@ class JsonStateStore:
                 if not self._cvss_payload_usable(payload):
                     continue
                 stored_at = entry.get("stored_at_iso")
-                self.cvss_cache[cve_id] = {
-                    "stored_at_iso": stored_at
-                    if isinstance(stored_at, str) and stored_at
-                    else datetime.now(timezone.utc).isoformat(),
-                    "data": payload,
-                }
+                if not self._cvss_stored_at_valid(stored_at):
+                    continue
+                self.cvss_cache[cve_id] = {"stored_at_iso": stored_at, "data": payload}
 
         self.pending_by_session = {}
         self.etag = None
@@ -163,10 +171,9 @@ class JsonStateStore:
                 if not self._cvss_payload_usable(payload):
                     continue
                 stored_at = entry.get("stored_at_iso")
-                self.cvss_cache[cve_id] = {
-                    "stored_at_iso": stored_at if isinstance(stored_at, str) else "",
-                    "data": payload,
-                }
+                if not self._cvss_stored_at_valid(stored_at):
+                    continue
+                self.cvss_cache[cve_id] = {"stored_at_iso": stored_at, "data": payload}
 
         self.pending_by_session = {}
         pending = data.get("pending_by_session")
@@ -215,7 +222,21 @@ class JsonStateStore:
         try:
             await asyncio.to_thread(self._write_json_atomic, self._snapshot())
         except Exception as e:
-            logger.error(f"[CVE漏洞推送] 状态保存失败: {sanitize(e)}")
+            self._degrade_on_write_failure("保存", e)
+
+    def _degrade_on_write_failure(self, context: str, error: Exception) -> None:
+        """首次写盘失败即降级为纯内存态，并且只告警一次。
+
+        目录本身存在但运行时权限被收回时，get_data_dir 不会抛异常，只靠 __init__
+        的判据发现不了；所以写失败也要能落到"本次运行不落盘"。
+        """
+        if not self._persistent:
+            return
+        self._persistent = False
+        logger.warning(
+            f"[CVE漏洞推送] 状态目录不可写，本次运行不落盘（不会写到任何其他位置）"
+            f"[{context}]: {sanitize(error)}"
+        )
 
     def _snapshot(self) -> dict[str, Any]:
         """产出一份与内部状态容器互不共享的快照。
@@ -292,28 +313,25 @@ class JsonStateStore:
     # ------------------------------------------------------------- CVSS 缓存
 
     def get_cvss(self, cve_id: str) -> dict[str, Any] | None:
+        """取一条未过期的缓存。
+
+        返回的是内部状态的视图，调用方**不得原地修改**；需要改动请先自行拷贝。
+        条目缺失、时间戳非法或已过 TTL 时返回 None，并顺手把该条目从缓存里剔除。
+        """
         entry = self.cvss_cache.get(cve_id)
         if not isinstance(entry, dict):
             return None
-        stored_at = entry.get("stored_at_iso")
-        if not isinstance(stored_at, str) or not stored_at:
-            self.cvss_cache.pop(cve_id, None)
-            return None
-        try:
-            stored_dt = datetime.fromisoformat(stored_at)
-        except ValueError:
-            self.cvss_cache.pop(cve_id, None)
-            return None
-        if stored_dt.tzinfo is None:
-            stored_dt = stored_dt.replace(tzinfo=timezone.utc)
-        if (datetime.now(timezone.utc) - stored_dt).days >= self.cvss_cache_ttl_days:
+        if self._cvss_entry_stale(entry.get("stored_at_iso")):
             self.cvss_cache.pop(cve_id, None)
             return None
         payload = entry.get("data")
         return payload if isinstance(payload, dict) else None
 
     def set_cvss(self, cve_id: str, data: dict[str, Any]) -> None:
-        """只缓存成功的结果。查询失败不得调用本方法。"""
+        """只缓存成功的结果。查询失败不得调用本方法。
+
+        传入的 data 存入后不得再由调用方修改（内部保留的是同一个 dict）。
+        """
         if not self._cvss_payload_usable(data):
             return
         self.cvss_cache[cve_id] = {
@@ -330,6 +348,33 @@ class JsonStateStore:
         severity = payload.get("cvss_base_severity")
         return isinstance(score, (int, float)) or (isinstance(severity, str) and bool(severity.strip()))
 
+    @staticmethod
+    def _cvss_stored_at_valid(stored_at: Any) -> bool:
+        """stored_at_iso 必须是非空字符串，否则按"已过期"处理。"""
+        return isinstance(stored_at, str) and bool(stored_at.strip())
+
+    def _cvss_entry_stale(self, stored_at: Any) -> bool:
+        """时间戳缺失/非法或已过 TTL 时返回 True（不可用）。"""
+        if not self._cvss_stored_at_valid(stored_at):
+            return True
+        try:
+            stored_dt = datetime.fromisoformat(stored_at)
+        except ValueError:
+            return True
+        if stored_dt.tzinfo is None:
+            stored_dt = stored_dt.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - stored_dt).days >= self.cvss_cache_ttl_days
+
+    def _drop_expired_cvss(self) -> None:
+        """清掉时间戳非法或已过 TTL 的条目（迁移路径写盘前调用）。"""
+        stale = [
+            cve_id
+            for cve_id, entry in self.cvss_cache.items()
+            if not isinstance(entry, dict) or self._cvss_entry_stale(entry.get("stored_at_iso"))
+        ]
+        for cve_id in stale:
+            self.cvss_cache.pop(cve_id, None)
+
     def _prune_cvss_cache(self) -> None:
         overflow = len(self.cvss_cache) - CVSS_CACHE_MAX_ENTRIES
         if overflow <= 0:
@@ -343,6 +388,10 @@ class JsonStateStore:
     # ------------------------------------------------------------ 待补发队列
 
     def get_pending_blocks(self, session: str) -> list[dict[str, str]]:
+        """取该会话待补发的块列表。
+
+        返回的列表是新建的，但列表里的 item dict 是内部状态的视图，调用方**不得原地修改**。
+        """
         entry = self.pending_by_session.get(session)
         if not isinstance(entry, dict):
             return []
@@ -371,10 +420,17 @@ class JsonStateStore:
             block = item.get("block")
             if isinstance(cve_id, str) and isinstance(block, str):
                 merged[cve_id] = {"cve_id": cve_id, "block": block}
-        self.pending_by_session[session] = {
-            "attempts": attempts,
-            "items": list(merged.values())[-PENDING_MAX_ITEMS_PER_SESSION:],
-        }
+
+        items = list(merged.values())
+        if len(items) > PENDING_MAX_ITEMS_PER_SESSION:
+            dropped = items[:-PENDING_MAX_ITEMS_PER_SESSION]
+            items = items[-PENDING_MAX_ITEMS_PER_SESSION:]
+            logger.error(
+                f"[CVE漏洞推送] 会话 {session} 待补发队列超过上限 "
+                f"{PENDING_MAX_ITEMS_PER_SESSION} 条，丢弃最旧 {len(dropped)} 条: "
+                f"{', '.join(str(item.get('cve_id')) for item in dropped)}"
+            )
+        self.pending_by_session[session] = {"attempts": attempts, "items": items}
         return True
 
     def clear_pending(self, session: str) -> None:
