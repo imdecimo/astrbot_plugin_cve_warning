@@ -181,6 +181,6 @@ data/plugin_data/astrbot_plugin_cve_warning/state.v1.json.bak
 
 ## 作者与许可
 
-- Author: `xiaochai_123`
-- Repo: <https://github.com/xiaochai-123/astrbot_plugin_cve_warning>
+- Author: `decimo`
+- Repo: <https://github.com/imdecimo/astrbot_plugin_cve_warning>
 - License: GPL

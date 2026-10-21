@@ -2,6 +2,6 @@ name: astrbot_plugin_cve_warning
 display_name: CVE漏洞推送
 desc: 基于 CISA KEV 的增量漏洞预警，按 catalogVersion 判定新增，合并摘要推送，支持中文摘要与按会话补发。
 version: v2.0.0
-author: xiaochai_123
-repo: https://github.com/xiaochai-123/astrbot_plugin_cve_warning
+author: decimo
+repo: https://github.com/imdecimo/astrbot_plugin_cve_warning
 astrbot_version: ">=4.11.2"
