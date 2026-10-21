@@ -208,6 +208,10 @@ class CVEWarningService:
             logger.error(
                 f"[CVE漏洞推送] KEV 目录解析结果异常，本轮不推进版本与基线: {anomaly}"
             )
+            await self._notify_failure(
+                f"KEV 目录解析异常，本轮未推送（count={catalog.get('count')}，"
+                f"实际解析出 {len(entries)} 条）: {anomaly}"
+            )
             await self._state.save()
             result.status = "catalog_anomaly"
             return self._record_cycle(result)
@@ -359,7 +363,17 @@ class CVEWarningService:
 
         发送循环只遍历目标会话，这些条目永远不会被重试或清理；留着既让状态里的
         待补发显示失真，也会在该会话被加回配置时把很久以前的内容整批推出去。
+        目标集合为空时跳过：那是"配置缺失/被清空"，不是"会话被删掉"，整批丢弃
+        会让用户重新配好会话后内容已经没了。
         """
+        if not self.target_sessions:
+            if self._state.pending_by_session:
+                logger.info(
+                    "[CVE漏洞推送] 未配置推送会话，保留待补发队列"
+                    f"（{len(self._state.pending_by_session)} 个会话）"
+                )
+            return
+
         targets = set(self.target_sessions)
         for session in list(self._state.pending_by_session):
             if session in targets:
