@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 
 _URL_USERINFO_RE = re.compile(
-    r"(?P<scheme>[a-zA-Z][a-zA-Z0-9+.\-]*://)(?P<userinfo>[^/@\s]+)@"
+    r"(?P<scheme>[a-zA-Z][a-zA-Z0-9+.\-]*://)(?P<userinfo>[^/?#\s]+)@"
 )
 
 
