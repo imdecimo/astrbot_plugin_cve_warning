@@ -45,7 +45,7 @@ class CVEWarningService:
         self.plugin_name = "astrbot_plugin_cve_warning"
 
         self.kev_feed_url = str(config.get("kev_feed_url") or DEFAULT_KEV_FEED_URL).strip()
-        self.interval_hours = int(config.get("push_interval_hours", 6) or 6)
+        self.interval_hours = min(48, max(1, int(config.get("push_interval_hours", 6) or 6)))
         self.interval_seconds = max(60, self.interval_hours * 3600)
         self.max_items_per_message = int(config.get("max_items_per_message", 15) or 15)
         self.http_proxy = str(config.get("http_proxy") or "").strip()
@@ -75,6 +75,7 @@ class CVEWarningService:
         self._refresh_lock = asyncio.Lock()
         self._next_run_at: datetime | None = None
         self.abandoned_total = 0
+        self.last_failed_sessions = 0
 
     # ------------------------------------------------------------- 生命周期
 
@@ -150,6 +151,7 @@ class CVEWarningService:
                 for session in self._state.pending_by_session
             },
             "abandoned_total": self.abandoned_total,
+            "last_failed_sessions": self.last_failed_sessions,
             "last_fetch_at_iso": self._state.last_fetch_at_iso,
             "last_push_at_iso": self._state.last_push_at_iso,
             "next_run_at": self._next_run_at.isoformat() if self._next_run_at else None,
@@ -179,13 +181,15 @@ class CVEWarningService:
                 return result
 
     async def _refresh_locked(self, result: RefreshResult) -> RefreshResult:
+        self._drop_zombie_pending()
+
         catalog, etag = await self._fetch_with_retry()
         self._state.touch_fetch()
 
         if catalog is None:
             logger.info("[CVE漏洞推送] KEV 目录未修改（304），本轮无操作")
             await self._state.save()
-            return result
+            return self._record_cycle(result)
 
         version_raw = catalog.get("catalogVersion")
         version = version_raw if isinstance(version_raw, str) and version_raw.strip() else None
@@ -195,9 +199,18 @@ class CVEWarningService:
             self._state.etag = etag or self._state.etag
             await self._state.save()
             logger.info(f"[CVE漏洞推送] catalogVersion 未变（{version}），本轮无操作")
-            return result
+            return self._record_cycle(result)
 
         entries = [e for e in (catalog.get("vulnerabilities") or []) if isinstance(e, dict)]
+
+        anomaly = self._catalog_anomaly(catalog, entries)
+        if anomaly:
+            logger.error(
+                f"[CVE漏洞推送] KEV 目录解析结果异常，本轮不推进版本与基线: {anomaly}"
+            )
+            await self._state.save()
+            result.status = "catalog_anomaly"
+            return self._record_cycle(result)
 
         if not self._state.baseline_cves:
             self._state.replace_baseline(entries)
@@ -208,7 +221,7 @@ class CVEWarningService:
                 f"[CVE漏洞推送] 已建立基线，共 {len(self._state.baseline_cves)} 条，"
                 f"本轮不推送。此后只推送新增。"
             )
-            return result
+            return self._record_cycle(result)
 
         if not self.target_sessions:
             self._state.merge_into_baseline(entries)
@@ -216,13 +229,13 @@ class CVEWarningService:
             await self._state.save()
             result.status = "no_targets"
             logger.warning("[CVE漏洞推送] 未配置推送会话，仅更新基线")
-            return result
+            return self._record_cycle(result)
 
         new_entries = self._state.select_new_entries(entries)
-        if not new_entries and not self._state.pending_by_session:
+        if not new_entries and not self._has_pending_for_targets():
             self._finish_cycle(version, etag)
             await self._state.save()
-            return result
+            return self._record_cycle(result)
 
         result.new_count = len(new_entries)
 
@@ -274,7 +287,7 @@ class CVEWarningService:
         self._finish_cycle(version, etag)
         await self._state.save()
         result.status = "pushed"
-        return result
+        return self._record_cycle(result)
 
     # --------------------------------------------------------------- 发送
 
@@ -319,11 +332,61 @@ class CVEWarningService:
         text = f"❌ [CVE漏洞推送] 刷新失败：{message}"
         for session in self.failure_notify_sessions:
             try:
-                await self.context.send_message(session, MessageChain([Comp.Plain(text)]))
+                sent = await self.context.send_message(
+                    session, MessageChain([Comp.Plain(text)])
+                )
             except Exception as e:
                 logger.warning(f"[CVE漏洞推送] 失败通知未送达 session={session}: {sanitize(e)}")
+                continue
+            if not sent:
+                logger.warning(
+                    f"[CVE漏洞推送] 失败通知未发出（找不到平台实例）session={session}"
+                )
 
     # --------------------------------------------------------- 内部工具
+
+    def _record_cycle(self, result: RefreshResult) -> RefreshResult:
+        """本轮正常收尾：记下适配器报错的会话数。异常路径不经过这里。"""
+        self.last_failed_sessions = result.failed_sessions
+        return result
+
+    def _has_pending_for_targets(self) -> bool:
+        """只看目标会话是否还有待补发，避免僵尸会话把这一轮当成"有事可做"。"""
+        return any(self._state.get_pending_blocks(session) for session in self.target_sessions)
+
+    def _drop_zombie_pending(self) -> None:
+        """丢弃已不在 target_sessions 里的会话的待补发条目。
+
+        发送循环只遍历目标会话，这些条目永远不会被重试或清理；留着既让状态里的
+        待补发显示失真，也会在该会话被加回配置时把很久以前的内容整批推出去。
+        """
+        targets = set(self.target_sessions)
+        for session in list(self._state.pending_by_session):
+            if session in targets:
+                continue
+            dropped = len(self._state.get_pending_blocks(session))
+            self._state.pending_by_session.pop(session, None)
+            logger.warning(
+                f"[CVE漏洞推送] session={session} 已不在 target_sessions 中，"
+                f"丢弃其 {dropped} 条待补发内容"
+            )
+
+    @staticmethod
+    def _catalog_anomaly(catalog: dict[str, Any], entries: list[dict[str, Any]]) -> str | None:
+        """目录解析结果是否明显异常；正常返回 None。
+
+        只在"解析出的条目少于目录自称的条数"时报警，那才是内容被静默丢掉的信号；
+        解析结果多于 count 不会丢内容，按正常处理。count 缺失时不做数量比对。
+        """
+        if not entries:
+            return f"vulnerabilities 解析为空（count={catalog.get('count')}）"
+        count = catalog.get("count")
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            return None
+        missing = count - len(entries)
+        if missing > 0 and missing * 20 > count:
+            return f"count={count} 但只解析出 {len(entries)} 条（少 {missing} 条）"
+        return None
 
     async def _fetch_with_retry(self) -> tuple[dict[str, Any] | None, str | None]:
         last_error: Exception | None = None
@@ -340,7 +403,7 @@ class CVEWarningService:
                     await asyncio.sleep(KEV_FETCH_RETRY_INTERVAL_SECONDS)
         raise RuntimeError(
             f"KEV 拉取失败: {type(last_error).__name__}: {sanitize(last_error)}"
-        )
+        ) from last_error
 
     async def _enrich_cvss(self, entries: list[dict[str, Any]]) -> None:
         missing: list[str] = []
@@ -359,7 +422,8 @@ class CVEWarningService:
                     data = await self._nvd_client.get_cvss(cve_id)
                 except Exception as e:
                     logger.warning(
-                        f"[CVE漏洞推送] NVD 查询失败 {cve_id}（不缓存，下轮重试）: {sanitize(e)}"
+                        f"[CVE漏洞推送] NVD 查询失败 {cve_id}（不写缓存，本次以 UNKNOWN 展示）: "
+                        f"{sanitize(e)}"
                     )
                     return
                 self._state.set_cvss(cve_id, data)
