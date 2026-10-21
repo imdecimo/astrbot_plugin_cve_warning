@@ -1,23 +1,18 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 from typing import Any
 
-
-def _truncate(text: str, max_len: int) -> str:
-    if not isinstance(text, str):
-        return ""
-    text = text.strip()
-    if len(text) <= max_len:
-        return text
-    return text[: max(0, max_len - 1)] + "..."
+DESCRIPTION_MAX_LEN = 120
+INDENT = "\u3000"
+SEVERITY_EMOJI = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🟢"}
+FALLBACK_EMOJI = "⚪"
 
 
-def _severity_bucket(base_severity: str | None, base_score: float | None) -> str:
+def severity_bucket(base_severity: Any, base_score: Any) -> str:
     if isinstance(base_severity, str) and base_severity.strip():
-        s = base_severity.strip().upper()
-        if s in {"CRITICAL", "HIGH", "MEDIUM", "LOW"}:
-            return s
+        label = base_severity.strip().upper()
+        if label in SEVERITY_EMOJI:
+            return label
     if isinstance(base_score, (int, float)):
         score = float(base_score)
         if score >= 9.0:
@@ -26,156 +21,87 @@ def _severity_bucket(base_severity: str | None, base_score: float | None) -> str
             return "HIGH"
         if score >= 4.0:
             return "MEDIUM"
+        if score > 0:
+            return "LOW"
     return "UNKNOWN"
 
 
-def get_severity_bucket(base_severity: str | None, base_score: float | None) -> str:
-    return _severity_bucket(base_severity, base_score)
+def _truncate(text: str, max_len: int) -> str:
+    text = (text or "").strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max(0, max_len - 1)] + "…"
 
 
-def _parse_tz(display_timezone: str) -> timezone | None:
-    if not isinstance(display_timezone, str):
-        return None
-    s = display_timezone.strip().upper()
-    if not s:
-        return None
-    if s == "UTC":
-        return timezone.utc
-    if not s.startswith("UTC"):
-        return None
-
-    tail = s[3:].strip()
-    if not tail:
-        return timezone.utc
-
-    if tail[0] == "+":
-        sign = 1
-        tail = tail[1:]
-    elif tail[0] == "-":
-        sign = -1
-        tail = tail[1:]
-    else:
-        return None
-
-    tail = tail.strip()
-    if not tail:
-        return None
-
-    try:
-        if ":" in tail:
-            hh_str, mm_str = tail.split(":", 1)
-            hh = int(hh_str)
-            mm = int(mm_str)
-        else:
-            hh = int(tail)
-            mm = 0
-        offset = sign * (hh * 60 + mm)
-        return timezone(timedelta(minutes=offset))
-    except Exception:
-        return None
+def _severity_label(bucket: str, base_score: Any) -> str:
+    if isinstance(base_score, (int, float)):
+        return f"{bucket} {float(base_score):.1f}"
+    return bucket
 
 
-def _format_kev_date(date_str: str, tz: timezone | None) -> str:
-    if not isinstance(date_str, str) or not date_str.strip():
-        return ""
-    raw = date_str.strip()
-    if tz is None:
-        return raw
-    try:
-        dt_utc = datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        dt_local = dt_utc.astimezone(tz)
-        return dt_local.strftime("%Y-%m-%d")
-    except Exception:
-        return raw
-
-
-def build_cve_message(
-    kev_entry: dict[str, Any],
-    cvss_info: dict[str, Any],
-    *,
-    short_description_max_len: int = 220,
-    include_cwe: bool = True,
-    critical_high_detailed: bool = True,
-    display_timezone: str = "UTC+8",
-) -> str:
-    cve_id = str(kev_entry.get("cveID") or "").strip()
+def build_cve_block(
+    entry: dict[str, Any],
+    cvss_info: dict[str, Any] | None,
+    summary: str | None,
+) -> dict[str, Any]:
+    cve_id = str(entry.get("cveID") or "").strip()
     if not cve_id:
         raise ValueError("KEV entry 缺少 cveID")
 
-    short_desc = str(kev_entry.get("shortDescription") or "").strip()
-    vendor = str(kev_entry.get("vendorProject") or "").strip()
-    product = str(kev_entry.get("product") or "").strip()
-    vuln_name = str(kev_entry.get("vulnerabilityName") or "").strip()
+    info = cvss_info or {}
+    bucket = severity_bucket(info.get("cvss_base_severity"), info.get("cvss_base_score"))
+    emoji = SEVERITY_EMOJI.get(bucket, FALLBACK_EMOJI)
+    lines = [f"{emoji} {cve_id} · {_severity_label(bucket, info.get('cvss_base_score'))}"]
 
-    required_action = str(kev_entry.get("requiredAction") or "").strip()
-    due_date = str(kev_entry.get("dueDate") or "").strip()
-    date_added = str(kev_entry.get("dateAdded") or "").strip()
-    known_ransom = str(kev_entry.get("knownRansomwareCampaignUse") or "").strip()
+    vendor = str(entry.get("vendorProject") or "").strip()
+    product = str(entry.get("product") or "").strip()
+    product_line = " / ".join(part for part in (vendor, product) if part)
+    if product_line:
+        lines.append(f"{INDENT}{product_line}")
 
-    tz = _parse_tz(display_timezone)
-    due_date_fmt = _format_kev_date(due_date, tz) if due_date else ""
-    date_added_fmt = _format_kev_date(date_added, tz) if date_added else ""
+    description = (summary or "").strip()
+    if not description:
+        description = _truncate(
+            str(entry.get("shortDescription") or entry.get("vulnerabilityName") or ""),
+            DESCRIPTION_MAX_LEN,
+        )
+    if description:
+        lines.append(f"{INDENT}{description}")
 
-    base_score = cvss_info.get("cvss_base_score")
-    base_sev = cvss_info.get("cvss_base_severity")
-    vector = cvss_info.get("cvss_vector")
-    cwe_list = cvss_info.get("cwe") or []
+    tail: list[str] = []
+    due_date = str(entry.get("dueDate") or "").strip()
+    if due_date:
+        tail.append(f"处置到期 {due_date}")
+    ransom = str(entry.get("knownRansomwareCampaignUse") or "").strip()
+    if ransom:
+        tail.append(f"勒索利用：{'是' if ransom.lower() == 'known' else ransom}")
+    if tail:
+        lines.append(f"{INDENT}{' · '.join(tail)}")
 
-    bucket = _severity_bucket(base_sev, base_score)
-    detailed = critical_high_detailed and bucket in {"CRITICAL", "HIGH"}
+    lines.append(f"{INDENT}https://nvd.nist.gov/vuln/detail/{cve_id}")
+    return {"cve_id": cve_id, "block": "\n".join(lines), "is_new": True}
 
-    description = _truncate(short_desc if short_desc else vuln_name, short_description_max_len)
-    required_action = _truncate(required_action, short_description_max_len)
-    nvd_link = f"https://nvd.nist.gov/vuln/detail/{cve_id}"
-    kev_link = "https://www.cisa.gov/known-exploited-vulnerabilities-catalog"
 
-    sev_line = f"严重等级：{bucket}"
-    if isinstance(base_score, (int, float)):
-        sev_line += f"（CVSS {float(base_score):.1f}）"
+def build_digest(blocks: list[dict[str, Any]], today: str, part: int, total_parts: int) -> str:
+    new_count = sum(1 for block in blocks if block.get("is_new"))
+    retry_count = len(blocks) - new_count
 
-    header = f"🛡️ [CISA KEV] CVE 漏洞推送\nCVE：{cve_id}"
+    header = f"🛡️ CISA KEV 新增预警 · {today}"
+    if total_parts > 1:
+        header += f"（{part}/{total_parts}）"
 
-    ransom_line = f"\n🍷 勒索已知利用：{known_ransom}" if known_ransom else ""
+    if new_count and retry_count:
+        intro = f"新增 {new_count} 条 + 补发 {retry_count} 条，均为已确认在野利用"
+    elif retry_count:
+        intro = f"补发 {retry_count} 条，均为已确认在野利用"
+    else:
+        intro = f"新增 {new_count} 条，均为已确认在野利用"
 
-    vendor_line = ""
-    if vendor or product:
-        vendor_line = f"\n🏢 影响范围：{vendor}{' / ' if vendor and product else ''}{product}".strip()
+    body = "\n\n".join(str(block.get("block") or "") for block in blocks)
+    footer = f"共 {len(blocks)} 条 · 数据源 CISA KEV"
+    return f"{header}\n{intro}\n\n{body}\n\n{footer}"
 
-    due_line = f"\n⏰ 处置到期：{due_date_fmt}" if due_date_fmt else ""
-    added_line = f"\n📌 加入日期：{date_added_fmt}" if date_added_fmt else ""
 
-    required_line = f"\n📝 CISA 建议操作：{required_action}" if (detailed and required_action) else ""
-    vector_line = f"\n🧾 CVSS 向量：{vector}" if (detailed and vector) else ""
-
-    cwe_line = ""
-    if detailed and include_cwe and isinstance(cwe_list, list) and cwe_list:
-        cwe_line = f"\n🧩 CWE：{', '.join([str(x).strip() for x in cwe_list if str(x).strip()])}"
-
-    if detailed:
-        return "\n".join(
-            [
-                header,
-                sev_line,
-                f"📝 描述：{description}",
-                vendor_line,
-                required_line,
-                due_line,
-                added_line,
-                vector_line,
-                cwe_line,
-                ransom_line,
-                f"\n🔗 NVD：{nvd_link}",
-                f"🔗 KEV：{kev_link}",
-            ]
-        ).replace("\n\n\n", "\n\n")
-
-    return "\n".join(
-        [
-            header,
-            sev_line,
-            f"📝 描述：{description}",
-            due_line,
-            ransom_line,
-            f"\n🔗 NVD：{nvd_link}",
-        ]
-    ).replace("\n\n\n", "\n\n")
+def chunk_blocks(blocks: list[dict[str, Any]], max_items_per_message: int) -> list[list[dict[str, Any]]]:
+    size = max(1, int(max_items_per_message))
+    return [blocks[i : i + size] for i in range(0, len(blocks), size)] or [[]]
