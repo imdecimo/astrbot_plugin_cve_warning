@@ -16,6 +16,9 @@ SCHEMA_VERSION = 2
 CVSS_CACHE_MAX_ENTRIES = 5000
 PENDING_MAX_ITEMS_PER_SESSION = 50
 PENDING_MAX_ATTEMPTS = 3
+# 写盘失败后重试一次的等待时间（秒）。Windows 上 os.replace 撞 WinError 32
+# 是杀软/索引器短暂占用文件造成的瞬时故障，几十毫秒足够过去。
+WRITE_RETRY_DELAY_SECONDS = 0.05
 
 
 class JsonStateStore:
@@ -90,14 +93,12 @@ class JsonStateStore:
                     await asyncio.to_thread(self._backup_v1_file)
                 except Exception as e:
                     logger.warning(f"[CVE漏洞推送] v1 状态备份失败: {sanitize(e)}")
-                try:
-                    await asyncio.to_thread(self._write_json_atomic, self._snapshot())
+                await self._write_with_retry("迁移写入")
+                if self._persistent:
                     logger.info(
                         f"[CVE漏洞推送] 状态已迁移到 v2：基线 {len(self.baseline_cves)} 条，"
                         f"CVSS 缓存 {len(self.cvss_cache)} 条（负缓存与来源不明条目已清理）"
                     )
-                except Exception as e:
-                    self._degrade_on_write_failure("迁移写入", e)
                 return
 
             self._load_v2(data)
@@ -215,18 +216,38 @@ class JsonStateStore:
 
     async def save(self) -> None:
         async with self._lock:
-            await self._write_snapshot()
+            await self._write_with_retry("保存")
 
     async def _write_snapshot(self) -> None:
+        await self._write_with_retry("保存")
+
+    async def _write_with_retry(self, context: str) -> None:
+        """写一次盘；失败则重试一次，两次都失败才降级为纯内存态。
+
+        一次瞬时失败（Windows 上 os.replace 撞 WinError 32 很常见）就永久熔断，
+        会让本次运行的待补发队列全部丢失，at-least-once 静默退化成 at-most-once。
+        重试也重新取快照：第一次失败期间内存态可能已被改动，复用旧 payload 会写回
+        陈旧内容。重试只有一次，不无限重试。
+        """
         if not self._persistent:
             return
         try:
             await asyncio.to_thread(self._write_json_atomic, self._snapshot())
+            return
         except Exception as e:
-            self._degrade_on_write_failure("保存", e)
+            first_error = e
+        logger.info(
+            f"[CVE漏洞推送] 状态写入失败，{WRITE_RETRY_DELAY_SECONDS * 1000:.0f}ms 后重试一次"
+            f"[{context}]: {sanitize(first_error)}"
+        )
+        await asyncio.sleep(WRITE_RETRY_DELAY_SECONDS)
+        try:
+            await asyncio.to_thread(self._write_json_atomic, self._snapshot())
+        except Exception as e:
+            self._degrade_on_write_failure(context, e)
 
     def _degrade_on_write_failure(self, context: str, error: Exception) -> None:
-        """首次写盘失败即降级为纯内存态，并且只告警一次。
+        """重试仍失败即降级为纯内存态，并且只告警一次。
 
         目录本身存在但运行时权限被收回时，get_data_dir 不会抛异常，只靠 __init__
         的判据发现不了；所以写失败也要能落到"本次运行不落盘"。
