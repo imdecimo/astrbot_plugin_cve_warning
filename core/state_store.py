@@ -135,6 +135,11 @@ class JsonStateStore:
         version = data.get("last_catalog_version")
         self.catalog_version = version if isinstance(version, str) and version else None
 
+        last_fetch = data.get("last_fetch_at_iso")
+        self.last_fetch_at_iso = last_fetch if isinstance(last_fetch, str) and last_fetch else None
+        last_push = data.get("last_push_at_iso")
+        self.last_push_at_iso = last_push if isinstance(last_push, str) and last_push else None
+
     def _load_v2(self, data: dict[str, Any]) -> None:
         version = data.get("catalog_version")
         self.catalog_version = version if isinstance(version, str) and version else None
@@ -169,7 +174,7 @@ class JsonStateStore:
             for session, entry in pending.items():
                 if not isinstance(session, str) or not isinstance(entry, dict):
                     continue
-                items: list[dict[str, str]] = []
+                deduped: dict[str, dict[str, str]] = {}
                 raw_items = entry.get("items")
                 if isinstance(raw_items, list):
                     for item in raw_items:
@@ -183,13 +188,14 @@ class JsonStateStore:
                             and isinstance(block, str)
                             and block.strip()
                         ):
-                            items.append({"cve_id": cve_id.strip(), "block": block})
-                if not items:
+                            key = cve_id.strip()
+                            deduped[key] = {"cve_id": key, "block": block}
+                if not deduped:
                     continue
                 attempts = entry.get("attempts")
                 self.pending_by_session[session] = {
                     "attempts": attempts if isinstance(attempts, int) and attempts > 0 else 1,
-                    "items": items[-PENDING_MAX_ITEMS_PER_SESSION:],
+                    "items": list(deduped.values())[-PENDING_MAX_ITEMS_PER_SESSION:],
                 }
 
         last_fetch = data.get("last_fetch_at_iso")
@@ -212,13 +218,44 @@ class JsonStateStore:
             logger.error(f"[CVE漏洞推送] 状态保存失败: {sanitize(e)}")
 
     def _snapshot(self) -> dict[str, Any]:
+        """产出一份与内部状态容器互不共享的快照。
+
+        逐层手工浅拷贝（不用 copy.deepcopy，状态可能上万条）：json.dump 在 worker
+        线程里只迭代快照自己的容器，所以保存期间其它协程改动活字典不会让 dump 抛出
+        "dictionary changed size during iteration"。
+        """
+        cvss_cache: dict[str, dict[str, Any]] = {}
+        for cve_id, entry in self.cvss_cache.items():
+            if not isinstance(entry, dict):
+                continue
+            payload = entry.get("data")
+            cvss_cache[cve_id] = {
+                "stored_at_iso": entry.get("stored_at_iso"),
+                "data": dict(payload) if isinstance(payload, dict) else payload,
+            }
+
+        pending_by_session: dict[str, dict[str, Any]] = {}
+        for session, entry in self.pending_by_session.items():
+            if not isinstance(entry, dict):
+                continue
+            raw_items = entry.get("items")
+            items = (
+                [dict(item) for item in raw_items if isinstance(item, dict)]
+                if isinstance(raw_items, list)
+                else []
+            )
+            pending_by_session[session] = {
+                "attempts": entry.get("attempts"),
+                "items": items,
+            }
+
         return {
             "schema_version": SCHEMA_VERSION,
             "catalog_version": self.catalog_version,
             "etag": self.etag,
-            "baseline_cves": self.baseline_cves,
-            "cvss_cache": self.cvss_cache,
-            "pending_by_session": self.pending_by_session,
+            "baseline_cves": dict(self.baseline_cves),
+            "cvss_cache": cvss_cache,
+            "pending_by_session": pending_by_session,
             "last_fetch_at_iso": self.last_fetch_at_iso,
             "last_push_at_iso": self.last_push_at_iso,
         }
