@@ -247,8 +247,8 @@ class CVEWarningPlugin(Star):
             f"⏭️ 下次运行: {status.get('next_run_at')}",
             f"🕒 拉取间隔: {interval_text}",
             f"📮 待补发会话与尝试次数: {pending_text}",
-            f"⚠️ 上轮适配器报错会话数: {status.get('last_failed_sessions')}",
-            f"🗑️ 累计放弃补发次数（按会话×轮次计）: {status.get('abandoned_total')}",
+            f"⚠️ 上轮适配器报错会话数（本次运行内）: {status.get('last_failed_sessions')}",
+            f"🗑️ 本次运行累计放弃补发次数（按会话×轮次计）: {status.get('abandoned_total')}",
             f"🤖 AI 摘要: {'开启' if status.get('ai_summary_enabled') else '关闭'}"
             f"（上次结果: {ai_outcome}）",
         ]
