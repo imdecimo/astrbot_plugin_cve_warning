@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 DESCRIPTION_MAX_LEN = 120
+SUMMARY_MAX_LEN = 200
 INDENT = "\u3000"
 SEVERITY_EMOJI = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🟢"}
 FALLBACK_EMOJI = "⚪"
@@ -59,7 +60,9 @@ def build_cve_block(
     if product_line:
         lines.append(f"{INDENT}{product_line}")
 
-    description = (summary or "").strip()
+    # 摘要也要封顶：模型失控返回长段落时单条消息会超过协议端上限，那条消息此后
+    # 每轮都发不出去、块文本又已冻结，3 轮后这批 CVE 对该会话永久丢失。
+    description = _truncate(str(summary or ""), SUMMARY_MAX_LEN)
     if not description:
         description = _truncate(
             str(entry.get("shortDescription") or entry.get("vulnerabilityName") or ""),
