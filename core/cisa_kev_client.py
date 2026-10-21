@@ -47,7 +47,7 @@ class CisaKevClient:
         except asyncio.TimeoutError as e:
             raise RuntimeError(f"KEV 请求超时（{self.timeout_s}s）: {sanitize(e)}") from e
         except aiohttp.ClientResponseError as e:
-            raise RuntimeError(f"KEV HTTP 错误: {e.status} {e.message}") from e
+            raise RuntimeError(sanitize(f"KEV HTTP 错误: {e.status} {e.message}")) from e
         except aiohttp.ClientError as e:
             raise RuntimeError(f"KEV 网络错误: {type(e).__name__} {sanitize(e)}") from e
 

@@ -51,7 +51,7 @@ class NvdClient:
                 f"NVD 请求超时（{self.timeout_s}s）: {type(e).__name__} {sanitize(e)}"
             ) from e
         except aiohttp.ClientResponseError as e:
-            raise RuntimeError(f"NVD HTTP 错误: {e.status} {e.message}") from e
+            raise RuntimeError(sanitize(f"NVD HTTP 错误: {e.status} {e.message}")) from e
         except aiohttp.ClientError as e:
             raise RuntimeError(f"NVD 网络错误: {type(e).__name__} {sanitize(e)}") from e
 
