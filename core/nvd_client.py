@@ -6,6 +6,8 @@ import aiohttp
 
 
 class NvdClient:
+    """只做一件事：查一个 CVE 的 CVSS。失败就抛异常，不做降级。"""
+
     def __init__(
         self,
         session: aiohttp.ClientSession,
@@ -16,26 +18,13 @@ class NvdClient:
     ) -> None:
         self.session = session
         self.api_key = api_key or ""
-        self.timeout_s = timeout_s
+        self.timeout_s = int(timeout_s)
         self.user_agent = user_agent
         self.proxy_url = str(proxy_url or "").strip() or None
-
         self._base_url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 
     async def get_cvss(self, cve_id: str) -> dict[str, Any]:
-        """
-        返回结构示例：
-        {
-          "cvss_base_score": float|None,
-          "cvss_base_severity": "CRITICAL"|"HIGH"|"MEDIUM"|"LOW"|None,
-          "cvss_vector": str|None,
-          "cwe": ["CWE-79", ...]
-        }
-        """
-        params = {
-            "cveId": cve_id,
-            "resultsPerPage": "1",
-        }
+        params = {"cveId": cve_id, "resultsPerPage": "1"}
         headers: dict[str, str] = {"User-Agent": self.user_agent}
         if self.api_key:
             headers["apiKey"] = self.api_key
@@ -50,78 +39,41 @@ class NvdClient:
             resp.raise_for_status()
             data = await resp.json(content_type=None)
 
-        vulns = data.get("vulnerabilities") if isinstance(data, dict) else None
-        if not vulns or not isinstance(vulns, list):
-            return {
-                "cvss_base_score": None,
-                "cvss_base_severity": None,
-                "cvss_vector": None,
-                "cwe": [],
-            }
+        return self._parse(data)
 
-        first_v = vulns[0] if isinstance(vulns[0], dict) else {}
-        cve_obj = first_v.get("cve", {}) if isinstance(first_v, dict) else {}
-        metrics = cve_obj.get("metrics", {}) if isinstance(cve_obj, dict) else {}
-
-        # CWE
-        cwe_list: list[str] = []
-        weaknesses = cve_obj.get("weaknesses", []) if isinstance(cve_obj, dict) else []
-        if isinstance(weaknesses, list):
-            for w in weaknesses:
-                if not isinstance(w, dict):
-                    continue
-                descs = w.get("description", [])
-                if isinstance(descs, list) and descs:
-                    first_desc = descs[0]
-                    if isinstance(first_desc, dict):
-                        val = first_desc.get("value")
-                        if isinstance(val, str) and val.strip():
-                            cwe_list.append(val.strip())
-
-        def _pick_metric(key: str) -> dict[str, Any] | None:
-            raw = metrics.get(key)
-            if isinstance(raw, list) and raw:
-                first = raw[0]
-                if isinstance(first, dict):
-                    return first
-            return None
-
-        cvss_entry = (
-            _pick_metric("cvssMetricV31")
-            or _pick_metric("cvssMetricV30")
-            or _pick_metric("cvssMetricV2")
-        )
-
-        cvss_base_score: float | None = None
-        cvss_base_severity: str | None = None
-        cvss_vector: str | None = None
-
-        if isinstance(cvss_entry, dict):
-            cvss_data = (
-                cvss_entry.get("cvssData")
-                if isinstance(cvss_entry.get("cvssData"), dict)
-                else None
-            )
-
-            if isinstance(cvss_data, dict):
-                base_score = cvss_data.get("baseScore")
-                base_sev = cvss_data.get("baseSeverity") or cvss_entry.get("baseSeverity")
-                vector = cvss_data.get("vectorString") or cvss_entry.get("vectorString")
-            else:
-                base_score = cvss_entry.get("baseScore")
-                base_sev = cvss_entry.get("baseSeverity")
-                vector = cvss_entry.get("vectorString")
-
-            if isinstance(base_score, (int, float)):
-                cvss_base_score = float(base_score)
-            if isinstance(base_sev, str) and base_sev.strip():
-                cvss_base_severity = base_sev.strip()
-            if isinstance(vector, str) and vector.strip():
-                cvss_vector = vector.strip()
-
-        return {
-            "cvss_base_score": cvss_base_score,
-            "cvss_base_severity": cvss_base_severity,
-            "cvss_vector": cvss_vector,
-            "cwe": cwe_list,
+    @staticmethod
+    def _parse(data: Any) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "cvss_base_score": None,
+            "cvss_base_severity": None,
+            "cvss_vector": None,
         }
+        vulns = data.get("vulnerabilities") if isinstance(data, dict) else None
+        if not isinstance(vulns, list) or not vulns:
+            return result
+
+        first = vulns[0] if isinstance(vulns[0], dict) else {}
+        cve_obj = first.get("cve") if isinstance(first.get("cve"), dict) else {}
+        metrics = cve_obj.get("metrics") if isinstance(cve_obj.get("metrics"), dict) else {}
+
+        entry = None
+        for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+            raw = metrics.get(key)
+            if isinstance(raw, list) and raw and isinstance(raw[0], dict):
+                entry = raw[0]
+                break
+        if not isinstance(entry, dict):
+            return result
+
+        cvss_data = entry.get("cvssData") if isinstance(entry.get("cvssData"), dict) else {}
+        score = cvss_data.get("baseScore", entry.get("baseScore"))
+        severity = cvss_data.get("baseSeverity") or entry.get("baseSeverity")
+        vector = cvss_data.get("vectorString") or entry.get("vectorString")
+
+        if isinstance(score, (int, float)):
+            result["cvss_base_score"] = float(score)
+        if isinstance(severity, str) and severity.strip():
+            result["cvss_base_severity"] = severity.strip()
+        if isinstance(vector, str) and vector.strip():
+            result["cvss_vector"] = vector.strip()
+        return result
