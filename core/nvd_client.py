@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import aiohttp
 
+from .log_utils import sanitize
+
 
 class NvdClient:
-    """只做一件事：查一个 CVE 的 CVSS。失败就抛异常，不做降级。"""
+    """只做一件事：查一个 CVE 的 CVSS。失败就抛异常，不做降级。
+
+    网络/HTTP/超时失败统一包装为 RuntimeError，消息已过 sanitize() 并带异常类型名，
+    调用方可直接落日志。凭据脱敏在这里兜底，不依赖调用点记得脱敏。
+    """
 
     def __init__(
         self,
@@ -29,15 +36,24 @@ class NvdClient:
         if self.api_key:
             headers["apiKey"] = self.api_key
 
-        async with self.session.get(
-            self._base_url,
-            params=params,
-            headers=headers,
-            timeout=self.timeout_s,
-            proxy=self.proxy_url,
-        ) as resp:
-            resp.raise_for_status()
-            data = await resp.json(content_type=None)
+        try:
+            async with self.session.get(
+                self._base_url,
+                params=params,
+                headers=headers,
+                timeout=self.timeout_s,
+                proxy=self.proxy_url,
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json(content_type=None)
+        except asyncio.TimeoutError as e:
+            raise RuntimeError(
+                f"NVD 请求超时（{self.timeout_s}s）: {type(e).__name__} {sanitize(e)}"
+            ) from e
+        except aiohttp.ClientResponseError as e:
+            raise RuntimeError(f"NVD HTTP 错误: {e.status} {e.message}") from e
+        except aiohttp.ClientError as e:
+            raise RuntimeError(f"NVD 网络错误: {type(e).__name__} {sanitize(e)}") from e
 
         return self._parse(data)
 
