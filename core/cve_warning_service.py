@@ -27,6 +27,12 @@ DEFAULT_KEV_FEED_URL = (
 
 @dataclass
 class RefreshResult:
+    """一轮刷新的结果。
+
+    ``ok=False`` 只表示本轮抛了异常；``catalog_anomaly`` 这类"没抛异常但也没正常完成"
+    的情况 ``ok`` 仍为 True，调用方必须以 ``status`` 判断本轮是否真的推进了版本与基线。
+    """
+
     ok: bool = True
     error: str | None = None
     status: str = "unchanged"
@@ -76,6 +82,8 @@ class CVEWarningService:
         self._next_run_at: datetime | None = None
         self.abandoned_total = 0
         self.last_failed_sessions = 0
+        # 内存态"当前是否处于失败态"，只用于对失败通知去重，不落盘。
+        self._failure_notified = False
 
     # ------------------------------------------------------------- 生命周期
 
@@ -165,22 +173,30 @@ class CVEWarningService:
         if not self._kev_client or not self._nvd_client:
             return RefreshResult(ok=False, error="service_not_ready")
 
+        # 启动首轮与手动刷新是用户可感知的主动尝试，每次失败都要通知；
+        # 定时轮按"连续失败"去重，避免断网几天时每轮刷一条。
+        force_notify = reason in {"startup", "manual"}
         async with self._refresh_lock:
             result = RefreshResult()
             try:
-                return await self._refresh_locked(result)
+                result = await self._refresh_locked(result, force_notify)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 result.ok = False
                 result.error = f"{type(e).__name__}: {sanitize(e)}"
                 logger.error(f"[CVE漏洞推送] 刷新失败: {sanitize(e)}")
-                if reason in {"startup", "manual"}:
-                    await self._notify_failure(result.error)
+                await self._notify_failure_once(result.error, force=force_notify)
+                if force_notify:
                     raise
                 return result
+            await self._notify_recovery_if_needed(result)
+            return result
 
-    async def _refresh_locked(self, result: RefreshResult) -> RefreshResult:
+    async def _refresh_locked(
+        self, result: RefreshResult, force_notify: bool = False
+    ) -> RefreshResult:
+        """force_notify=True 时目录解析异常也每次都报警（启动/手动轮）。"""
         await self._drop_zombie_pending()
 
         catalog, etag = await self._fetch_with_retry()
@@ -216,9 +232,10 @@ class CVEWarningService:
             logger.error(
                 f"[CVE漏洞推送] KEV 目录解析结果异常，本轮不推进版本与基线: {anomaly}"
             )
-            await self._notify_failure(
+            await self._notify_failure_once(
                 f"KEV 目录解析异常，本轮未推送（count={catalog.get('count')}，"
-                f"实际解析出 {len(entries)} 条）: {anomaly}"
+                f"实际解析出 {len(entries)} 条）: {anomaly}",
+                force=force_notify,
             )
             await self._state.save()
             result.status = "catalog_anomaly"
@@ -353,10 +370,14 @@ class CVEWarningService:
                 return False
         return True
 
-    async def _notify_failure(self, message: str) -> None:
+    async def _notify_failure(self, message: str, *, recovery: bool = False) -> None:
         if not self.failure_notify_sessions:
             return
-        text = f"❌ [CVE漏洞推送] 刷新失败：{message}"
+        text = (
+            f"✅ [CVE漏洞推送] 已恢复：{message}"
+            if recovery
+            else f"❌ [CVE漏洞推送] 刷新失败：{message}"
+        )
         for session in self.failure_notify_sessions:
             try:
                 sent = await self.context.send_message(
@@ -369,6 +390,33 @@ class CVEWarningService:
                 logger.warning(
                     f"[CVE漏洞推送] 失败通知未发出（找不到平台实例）session={session}"
                 )
+
+    async def _notify_failure_once(self, message: str, *, force: bool = False) -> None:
+        """按"连续失败"去重地发失败通知。
+
+        定时轮只在失败态由"正常"翻转为"失败"时发一条，此后持续失败只写日志——
+        断网几天时每轮都发会把群里刷成告警墙，也让人对告警脱敏。force=True
+        用于启动首轮与手动刷新：用户主动触发或服务刚起来，每次都要让他知道没成。
+        """
+        if not self.failure_notify_sessions:
+            return
+        if self._failure_notified and not force:
+            logger.info("[CVE漏洞推送] 仍处于失败状态，本轮不重复通知（原因见本轮 error 日志）")
+            return
+        self._failure_notified = True
+        await self._notify_failure(message)
+
+    async def _notify_recovery_if_needed(self, result: RefreshResult) -> None:
+        """此前确实处于失败态时发一条"已恢复"；一直正常就不发。
+
+        catalog_anomaly 没抛异常但也没正常完成（版本与基线都没推进），不算恢复。
+        """
+        if result.status == "catalog_anomaly":
+            return
+        if not self._failure_notified:
+            return
+        self._failure_notified = False
+        await self._notify_failure("本轮拉取与推送已恢复正常", recovery=True)
 
     # --------------------------------------------------------- 内部工具
 
@@ -419,11 +467,17 @@ class CVEWarningService:
     def _catalog_anomaly(catalog: dict[str, Any], entries: list[dict[str, Any]]) -> str | None:
         """目录解析结果是否明显异常；正常返回 None。
 
-        只在"解析出的条目少于目录自称的条数"时报警，那才是内容被静默丢掉的信号；
-        解析结果多于 count 不会丢内容，按正常处理。count 缺失时不做数量比对。
+        两种判据：解析出的条目少于目录自称条数超过 5%（内容被静默丢掉），
+        以及条目非空但一条 cveID 都取不到（字段被 CISA 改名）。后者若不判，
+        select_new_entries 会返回空、条数又对得上，于是版本照常推进、基线冻结、
+        插件从此静默无声。解析结果多于 count 不丢内容，按正常处理；count 缺失时
+        不做数量比对。
         """
         if not entries:
             return f"vulnerabilities 解析为空（count={catalog.get('count')}）"
+        usable = sum(1 for entry in entries if str(entry.get("cveID") or "").strip())
+        if usable == 0:
+            return f"解析出的 {len(entries)} 条全部取不到 cveID（字段名可能被改）"
         count = catalog.get("count")
         if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
             return None
@@ -497,6 +551,12 @@ class CVEWarningService:
 
     @staticmethod
     def _normalize_sessions(value: Any) -> list[str]:
+        """清洗配置里的会话列表，并按首次出现顺序去重。
+
+        重复写同一个 UMO 会让同一轮给同一会话发多遍完全相同的 digest，
+        failed_sessions 也会重复计数。
+        """
         if not isinstance(value, list):
             return []
-        return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+        cleaned = [item.strip() for item in value if isinstance(item, str) and item.strip()]
+        return list(dict.fromkeys(cleaned))
