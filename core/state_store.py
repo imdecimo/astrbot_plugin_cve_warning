@@ -83,7 +83,8 @@ class JsonStateStore:
 
             if data.get("schema_version") != SCHEMA_VERSION:
                 self._migrate_from_v1(data)
-                self._drop_expired_cvss()
+                # 只做容量裁剪；按年龄的过期交给 get_cvss() 惰性处理，
+                # 迁移时扫年龄没有正确性收益，还会误伤合法的 v1 状态。
                 self._prune_cvss_cache()
                 try:
                     await asyncio.to_thread(self._backup_v1_file)
@@ -93,7 +94,7 @@ class JsonStateStore:
                     await asyncio.to_thread(self._write_json_atomic, self._snapshot())
                     logger.info(
                         f"[CVE漏洞推送] 状态已迁移到 v2：基线 {len(self.baseline_cves)} 条，"
-                        f"CVSS 缓存 {len(self.cvss_cache)} 条（负缓存与过期条目已清理）"
+                        f"CVSS 缓存 {len(self.cvss_cache)} 条（负缓存与来源不明条目已清理）"
                     )
                 except Exception as e:
                     self._degrade_on_write_failure("迁移写入", e)
@@ -350,7 +351,7 @@ class JsonStateStore:
 
     @staticmethod
     def _cvss_stored_at_valid(stored_at: Any) -> bool:
-        """stored_at_iso 必须是非空字符串，否则按"已过期"处理。"""
+        """stored_at_iso 必须是非空字符串；缺失或不合法即视为来源不明，调用方丢弃。"""
         return isinstance(stored_at, str) and bool(stored_at.strip())
 
     def _cvss_entry_stale(self, stored_at: Any) -> bool:
@@ -364,16 +365,6 @@ class JsonStateStore:
         if stored_dt.tzinfo is None:
             stored_dt = stored_dt.replace(tzinfo=timezone.utc)
         return (datetime.now(timezone.utc) - stored_dt).days >= self.cvss_cache_ttl_days
-
-    def _drop_expired_cvss(self) -> None:
-        """清掉时间戳非法或已过 TTL 的条目（迁移路径写盘前调用）。"""
-        stale = [
-            cve_id
-            for cve_id, entry in self.cvss_cache.items()
-            if not isinstance(entry, dict) or self._cvss_entry_stale(entry.get("stored_at_iso"))
-        ]
-        for cve_id in stale:
-            self.cvss_cache.pop(cve_id, None)
 
     def _prune_cvss_cache(self) -> None:
         overflow = len(self.cvss_cache) - CVSS_CACHE_MAX_ENTRIES
