@@ -1,341 +1,457 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import os
-from collections import deque
+import shutil
 from datetime import datetime, timezone
 from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.star import StarTools
 
+from .log_utils import sanitize
+
+SCHEMA_VERSION = 2
+CVSS_CACHE_MAX_ENTRIES = 5000
+PENDING_MAX_ITEMS_PER_SESSION = 50
+PENDING_MAX_ATTEMPTS = 3
+# 写盘失败后重试一次的等待时间（秒）。Windows 上 os.replace 撞 WinError 32
+# 是杀软/索引器短暂占用文件造成的瞬时故障，几十毫秒足够过去。
+WRITE_RETRY_DELAY_SECONDS = 0.05
+
 
 class JsonStateStore:
-    """
-    轻量状态存储：
-    - pushed_at_by_cve: 全局“该 CVE 已完成推送”（legacy；用于 push_only_new 逻辑）
-    - seen_at_by_cve:   “该 CVE 已被扫描到/处理过”（severity 过滤时避免每轮都命中）
-    - suppressed_at_by_cve: “该 CVE 因当前策略暂不推送”（例如低危通知关闭）
-    - delivered_at_by_session: 按 session 粒度记录投递成功状态
-      delivered_at_by_session[session][cve_id] = iso
-    - cvss_cache: CVSS 缓存（减少 NVD 请求）
-      cvss_cache[cve_id] = {"stored_at_iso": "...", "data": {...}}
+    """三实体状态：基线 + CVSS 缓存 + 按会话的待补发队列。
+
+    持久化唯一落点由 StarTools.get_data_dir() 决定；取不到时降级为纯内存态，
+    绝不写到任何其他位置。
     """
 
     def __init__(
         self,
         plugin_name: str,
         state_file_name: str = "state.json",
-        state_max_entries: int = 5000,
         cvss_cache_ttl_days: int = 30,
-        *,
-        seen_max_entries: int = 20000,
-        delivered_max_entries_per_session: int = 5000,
-        cvss_cache_max_entries: int = 20000,
     ) -> None:
-        self.plugin_name = plugin_name
-        self.storage_dir = StarTools.get_data_dir(plugin_name)
-        self.state_file_path = os.path.join(self.storage_dir, state_file_name)
-
-        self.state_max_entries = max(100, int(state_max_entries))
-        self.seen_max_entries = max(100, int(seen_max_entries))
-        self.delivered_max_entries_per_session = max(100, int(delivered_max_entries_per_session))
-        self.cvss_cache_max_entries = max(100, int(cvss_cache_max_entries))
-
         self.cvss_cache_ttl_days = max(1, int(cvss_cache_ttl_days))
-
         self._lock = asyncio.Lock()
+        self._persistent = True
+        self.storage_dir = ""
+        self.state_file_path = ""
 
-        self.pushed_at_by_cve: dict[str, str] = {}
-        self.seen_at_by_cve: dict[str, str] = {}
-        self.suppressed_at_by_cve: dict[str, dict[str, Any]] = {}
-        self.delivered_at_by_session: dict[str, dict[str, str]] = {}
+        try:
+            data_dir = StarTools.get_data_dir(plugin_name)
+            if not data_dir or not str(data_dir).strip():
+                raise RuntimeError("StarTools.get_data_dir returned empty path")
+            self.storage_dir = str(data_dir)
+            self.state_file_path = os.path.join(self.storage_dir, state_file_name)
+        except Exception as e:
+            self._persistent = False
+            self.storage_dir = ""
+            self.state_file_path = ""
+            logger.warning(
+                f"[CVE漏洞推送] 状态目录不可用，本次运行不落盘（不会写到任何其他位置）: {sanitize(e)}"
+            )
+
+        self.catalog_version: str | None = None
+        self.etag: str | None = None
+        self.baseline_cves: dict[str, str] = {}
         self.cvss_cache: dict[str, dict[str, Any]] = {}
-
-        self.last_catalog_version: str | None = None
+        self.pending_by_session: dict[str, dict[str, Any]] = {}
         self.last_fetch_at_iso: str | None = None
         self.last_push_at_iso: str | None = None
 
-        self._pushed_order: deque[str] = deque()
-        self._seen_order: deque[str] = deque()
-        self._suppressed_order: deque[str] = deque()
-        self._delivered_order_by_session: dict[str, deque[str]] = {}
-        self._cvss_order: deque[str] = deque()
+    @property
+    def persistent(self) -> bool:
+        return self._persistent
+
+    # ------------------------------------------------------------------ 载入
 
     async def load(self) -> None:
         async with self._lock:
+            if not self._persistent:
+                return
             try:
                 os.makedirs(self.storage_dir, exist_ok=True)
                 if not os.path.exists(self.state_file_path):
-                    self._rebuild_orders()
                     return
-
-                with open(self.state_file_path, encoding="utf-8") as f:
-                    data = json.load(f)
-
-                if not isinstance(data, dict):
-                    self._rebuild_orders()
-                    return
-
-                pushed = data.get("pushed_at_by_cve", {})
-                if isinstance(pushed, dict):
-                    self.pushed_at_by_cve = {
-                        str(k): str(v)
-                        for k, v in pushed.items()
-                        if isinstance(k, str) and isinstance(v, str)
-                    }
-
-                seen = data.get("seen_at_by_cve", {})
-                if isinstance(seen, dict):
-                    self.seen_at_by_cve = {
-                        str(k): str(v)
-                        for k, v in seen.items()
-                        if isinstance(k, str) and isinstance(v, str)
-                    }
-
-                suppressed = data.get("suppressed_at_by_cve", {})
-                rebuilt_suppressed: dict[str, dict[str, Any]] = {}
-                if isinstance(suppressed, dict):
-                    for cve, info in suppressed.items():
-                        if not isinstance(cve, str):
-                            continue
-                        if isinstance(info, dict):
-                            rebuilt_suppressed[cve] = info
-                        elif isinstance(info, str):
-                            rebuilt_suppressed[cve] = {"suppressed_at_iso": info}
-                self.suppressed_at_by_cve = rebuilt_suppressed
-
-                delivered = data.get("delivered_at_by_session", {})
-                rebuilt_delivered: dict[str, dict[str, str]] = {}
-                if isinstance(delivered, dict):
-                    for sess, sess_map in delivered.items():
-                        if not isinstance(sess, str) or not isinstance(sess_map, dict):
-                            continue
-                        rebuilt_delivered[sess] = {
-                            str(cve): str(ts)
-                            for cve, ts in sess_map.items()
-                            if isinstance(cve, str) and isinstance(ts, str)
-                        }
-                self.delivered_at_by_session = rebuilt_delivered
-
-                cache = data.get("cvss_cache", {})
-                if isinstance(cache, dict):
-                    rebuilt_cvss: dict[str, dict[str, Any]] = {}
-                    for k, v in cache.items():
-                        if not isinstance(k, str) or not isinstance(v, dict):
-                            continue
-                        if "data" in v and isinstance(v.get("data"), dict):
-                            rebuilt_cvss[k] = v
-                        else:
-                            rebuilt_cvss[k] = {"stored_at_iso": None, "data": v}
-                    self.cvss_cache = rebuilt_cvss
-
-                self.last_catalog_version = data.get("last_catalog_version")
-                self.last_fetch_at_iso = data.get("last_fetch_at_iso")
-                self.last_push_at_iso = data.get("last_push_at_iso")
-
-                self._rebuild_orders()
-                self._prune_all_unsafe()
+                data = await asyncio.to_thread(self._read_json_file)
             except Exception as e:
-                logger.error(f"[CVE漏洞推送] 状态加载失败，将使用空状态: {e}")
-                self._rebuild_orders()
+                logger.error(f"[CVE漏洞推送] 状态加载失败，将使用空状态: {sanitize(e)}")
+                return
 
-    def _rebuild_orders(self) -> None:
-        pushed_items = list(self.pushed_at_by_cve.items())
-        pushed_items.sort(key=lambda kv: kv[1])
-        self._pushed_order = deque([cve for cve, _ in pushed_items])
+            if not isinstance(data, dict):
+                return
 
-        seen_items = list(self.seen_at_by_cve.items())
-        seen_items.sort(key=lambda kv: kv[1])
-        self._seen_order = deque([cve for cve, _ in seen_items])
+            if data.get("schema_version") != SCHEMA_VERSION:
+                self._migrate_from_v1(data)
+                # 只做容量裁剪；按年龄的过期交给 get_cvss() 惰性处理，
+                # 迁移时扫年龄没有正确性收益，还会误伤合法的 v1 状态。
+                self._prune_cvss_cache()
+                try:
+                    await asyncio.to_thread(self._backup_v1_file)
+                except Exception as e:
+                    logger.warning(f"[CVE漏洞推送] v1 状态备份失败: {sanitize(e)}")
+                await self._write_with_retry("迁移写入")
+                if self._persistent:
+                    logger.info(
+                        f"[CVE漏洞推送] 状态已迁移到 v2：基线 {len(self.baseline_cves)} 条，"
+                        f"CVSS 缓存 {len(self.cvss_cache)} 条（负缓存与来源不明条目已清理）"
+                    )
+                return
 
-        suppressed_items: list[tuple[str, str]] = []
-        for cve_id, info in self.suppressed_at_by_cve.items():
-            if not isinstance(info, dict):
+            self._load_v2(data)
+            self._prune_cvss_cache()
+
+    def _read_json_file(self) -> Any:
+        with open(self.state_file_path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def _backup_v1_file(self) -> None:
+        if not os.path.exists(self.state_file_path):
+            return
+        backup_path = os.path.join(self.storage_dir, "state.v1.json.bak")
+        shutil.copy2(self.state_file_path, backup_path)
+
+    def _migrate_from_v1(self, data: dict[str, Any]) -> None:
+        self.baseline_cves = {}
+        # 基线取三本"见过"账的并集：v1 里被严重度过滤挡下的条目只进了 seen/suppressed，
+        # 只按 pushed_at_by_cve 播种会让升级后的第一轮把它们全当新增（升级版首装洪水）。
+        for field in ("pushed_at_by_cve", "seen_at_by_cve", "suppressed_at_by_cve"):
+            bucket = data.get(field)
+            if not isinstance(bucket, dict):
                 continue
-            ts = info.get("suppressed_at_iso")
-            suppressed_items.append((cve_id, ts if isinstance(ts, str) else ""))
-        suppressed_items.sort(key=lambda kv: kv[1])
-        self._suppressed_order = deque([cve for cve, _ in suppressed_items])
+            for cve_id in bucket:
+                if isinstance(cve_id, str) and cve_id.strip():
+                    self.baseline_cves[cve_id.strip()] = ""
 
-        self._delivered_order_by_session = {}
-        for sess, m in self.delivered_at_by_session.items():
-            if not isinstance(m, dict):
-                continue
-            items = list(m.items())
-            items.sort(key=lambda kv: kv[1])
-            self._delivered_order_by_session[sess] = deque([cve for cve, _ in items])
+        self.cvss_cache = {}
+        cache = data.get("cvss_cache")
+        if isinstance(cache, dict):
+            for cve_id, entry in cache.items():
+                if not isinstance(cve_id, str) or not isinstance(entry, dict):
+                    continue
+                payload = entry.get("data") if isinstance(entry.get("data"), dict) else entry
+                if not self._cvss_payload_usable(payload):
+                    continue
+                stored_at = entry.get("stored_at_iso")
+                if not self._cvss_stored_at_valid(stored_at):
+                    continue
+                self.cvss_cache[cve_id] = {"stored_at_iso": stored_at, "data": payload}
 
-        cvss_items: list[tuple[str, str]] = []
-        for cve_id, v in self.cvss_cache.items():
-            if not isinstance(v, dict):
-                continue
-            stored_at = v.get("stored_at_iso")
-            cvss_items.append((cve_id, stored_at if isinstance(stored_at, str) else ""))
-        cvss_items.sort(key=lambda kv: kv[1])
-        self._cvss_order = deque([cve for cve, _ in cvss_items])
+        self.pending_by_session = {}
+        self.etag = None
+        version = data.get("last_catalog_version")
+        self.catalog_version = version if isinstance(version, str) and version else None
+
+        last_fetch = data.get("last_fetch_at_iso")
+        self.last_fetch_at_iso = last_fetch if isinstance(last_fetch, str) and last_fetch else None
+        last_push = data.get("last_push_at_iso")
+        self.last_push_at_iso = last_push if isinstance(last_push, str) and last_push else None
+
+    def _load_v2(self, data: dict[str, Any]) -> None:
+        version = data.get("catalog_version")
+        self.catalog_version = version if isinstance(version, str) and version else None
+        etag = data.get("etag")
+        self.etag = etag if isinstance(etag, str) and etag else None
+
+        self.baseline_cves = {}
+        baseline = data.get("baseline_cves")
+        if isinstance(baseline, dict):
+            for key, value in baseline.items():
+                if isinstance(key, str) and key.strip():
+                    self.baseline_cves[key.strip()] = value if isinstance(value, str) else ""
+
+        self.cvss_cache = {}
+        cache = data.get("cvss_cache")
+        if isinstance(cache, dict):
+            for cve_id, entry in cache.items():
+                if not isinstance(cve_id, str) or not isinstance(entry, dict):
+                    continue
+                payload = entry.get("data")
+                if not self._cvss_payload_usable(payload):
+                    continue
+                stored_at = entry.get("stored_at_iso")
+                if not self._cvss_stored_at_valid(stored_at):
+                    continue
+                self.cvss_cache[cve_id] = {"stored_at_iso": stored_at, "data": payload}
+
+        self.pending_by_session = {}
+        pending = data.get("pending_by_session")
+        if isinstance(pending, dict):
+            for session, entry in pending.items():
+                if not isinstance(session, str) or not isinstance(entry, dict):
+                    continue
+                deduped: dict[str, dict[str, str]] = {}
+                raw_items = entry.get("items")
+                if isinstance(raw_items, list):
+                    for item in raw_items:
+                        if not isinstance(item, dict):
+                            continue
+                        cve_id = item.get("cve_id")
+                        block = item.get("block")
+                        if (
+                            isinstance(cve_id, str)
+                            and cve_id.strip()
+                            and isinstance(block, str)
+                            and block.strip()
+                        ):
+                            key = cve_id.strip()
+                            deduped[key] = {"cve_id": key, "block": block}
+                if not deduped:
+                    continue
+                attempts = entry.get("attempts")
+                self.pending_by_session[session] = {
+                    "attempts": attempts if isinstance(attempts, int) and attempts > 0 else 1,
+                    "items": list(deduped.values())[-PENDING_MAX_ITEMS_PER_SESSION:],
+                }
+
+        last_fetch = data.get("last_fetch_at_iso")
+        self.last_fetch_at_iso = last_fetch if isinstance(last_fetch, str) else None
+        last_push = data.get("last_push_at_iso")
+        self.last_push_at_iso = last_push if isinstance(last_push, str) else None
+
+    # ------------------------------------------------------------------ 保存
 
     async def save(self) -> None:
         async with self._lock:
-            try:
-                os.makedirs(self.storage_dir, exist_ok=True)
-                payload = {
-                    "pushed_at_by_cve": self.pushed_at_by_cve,
-                    "seen_at_by_cve": self.seen_at_by_cve,
-                    "suppressed_at_by_cve": self.suppressed_at_by_cve,
-                    "delivered_at_by_session": self.delivered_at_by_session,
-                    "cvss_cache": self.cvss_cache,
-                    "last_catalog_version": self.last_catalog_version,
-                    "last_fetch_at_iso": self.last_fetch_at_iso,
-                    "last_push_at_iso": self.last_push_at_iso,
-                }
-                tmp_path = self.state_file_path + ".tmp"
-                with open(tmp_path, "w", encoding="utf-8") as f:
-                    json.dump(payload, f, ensure_ascii=False, indent=2)
-                os.replace(tmp_path, self.state_file_path)
-            except Exception as e:
-                logger.error(f"[CVE漏洞推送] 状态保存失败: {e}")
+            await self._write_with_retry("保存")
 
-    def is_cve_pushed(self, cve_id: str) -> bool:
-        return cve_id in self.pushed_at_by_cve
+    async def _write_snapshot(self) -> None:
+        await self._write_with_retry("保存")
 
-    async def mark_cve_pushed(self, cve_id: str) -> None:
-        now_iso = datetime.now(timezone.utc).isoformat()
-        self.pushed_at_by_cve[cve_id] = now_iso
-        self._touch_order(self._pushed_order, cve_id)
-        self._prune_dict_by_order(self.pushed_at_by_cve, self._pushed_order, self.state_max_entries)
+    async def _write_with_retry(self, context: str) -> None:
+        """写一次盘；失败则重试一次，两次都失败才降级为纯内存态。
 
-    def is_cve_seen(self, cve_id: str) -> bool:
-        return cve_id in self.seen_at_by_cve
-
-    async def mark_cve_seen(self, cve_id: str) -> None:
-        now_iso = datetime.now(timezone.utc).isoformat()
-        self.seen_at_by_cve[cve_id] = now_iso
-        self._touch_order(self._seen_order, cve_id)
-        self._prune_dict_by_order(self.seen_at_by_cve, self._seen_order, self.seen_max_entries)
-
-    def is_cve_suppressed(self, cve_id: str) -> bool:
-        return cve_id in self.suppressed_at_by_cve
-
-    async def mark_cve_suppressed(self, cve_id: str, *, bucket: str, date_added: str) -> None:
-        now_iso = datetime.now(timezone.utc).isoformat()
-        self.suppressed_at_by_cve[cve_id] = {
-            "suppressed_at_iso": now_iso,
-            "bucket": str(bucket or "").strip().upper(),
-            "date_added": str(date_added or "").strip(),
-        }
-        self._touch_order(self._suppressed_order, cve_id)
-        self._prune_dict_by_order(self.suppressed_at_by_cve, self._suppressed_order, self.seen_max_entries)
-
-    async def clear_cve_suppressed(self, cve_id: str) -> None:
-        self.suppressed_at_by_cve.pop(cve_id, None)
+        一次瞬时失败（Windows 上 os.replace 撞 WinError 32 很常见）就永久熔断，
+        会让本次运行的待补发队列全部丢失，at-least-once 静默退化成 at-most-once。
+        重试也重新取快照：第一次失败期间内存态可能已被改动，复用旧 payload 会写回
+        陈旧内容。重试只有一次，不无限重试。
+        """
+        if not self._persistent:
+            return
         try:
-            self._suppressed_order.remove(cve_id)
-        except ValueError:
-            pass
+            await asyncio.to_thread(self._write_json_atomic, self._snapshot())
+            return
+        except Exception as e:
+            first_error = e
+        logger.info(
+            f"[CVE漏洞推送] 状态写入失败，{WRITE_RETRY_DELAY_SECONDS * 1000:.0f}ms 后重试一次"
+            f"[{context}]: {sanitize(first_error)}"
+        )
+        await asyncio.sleep(WRITE_RETRY_DELAY_SECONDS)
+        try:
+            await asyncio.to_thread(self._write_json_atomic, self._snapshot())
+        except Exception as e:
+            self._degrade_on_write_failure(context, e)
 
-    def is_cve_delivered(self, session: str, cve_id: str) -> bool:
-        m = self.delivered_at_by_session.get(session)
-        return bool(isinstance(m, dict) and cve_id in m)
+    def _degrade_on_write_failure(self, context: str, error: Exception) -> None:
+        """重试仍失败即降级为纯内存态，并且只告警一次。
 
-    async def mark_cve_delivered(self, session: str, cve_id: str) -> None:
-        now_iso = datetime.now(timezone.utc).isoformat()
-        if session not in self.delivered_at_by_session or not isinstance(
-            self.delivered_at_by_session.get(session), dict
-        ):
-            self.delivered_at_by_session[session] = {}
-        self.delivered_at_by_session[session][cve_id] = now_iso
-
-        order = self._delivered_order_by_session.get(session)
-        if order is None:
-            order = deque()
-            self._delivered_order_by_session[session] = order
-
-        self._touch_order(order, cve_id)
-        self._prune_dict_by_order(
-            self.delivered_at_by_session[session],
-            order,
-            self.delivered_max_entries_per_session,
+        目录本身存在但运行时权限被收回时，get_data_dir 不会抛异常，只靠 __init__
+        的判据发现不了；所以写失败也要能落到"本次运行不落盘"。
+        """
+        if not self._persistent:
+            return
+        self._persistent = False
+        logger.warning(
+            f"[CVE漏洞推送] 状态目录不可写，本次运行不落盘（不会写到任何其他位置）"
+            f"[{context}]: {sanitize(error)}"
         )
 
-    def get_cvss_cached(self, cve_id: str) -> dict[str, Any] | None:
-        val = self.cvss_cache.get(cve_id)
-        if not isinstance(val, dict):
-            return None
+    def _snapshot(self) -> dict[str, Any]:
+        """产出一份与内部状态容器互不共享的快照。
 
-        data = val.get("data")
-        if not isinstance(data, dict):
-            return None
-
-        stored_at_iso = val.get("stored_at_iso")
-        if isinstance(stored_at_iso, str) and stored_at_iso.strip():
-            try:
-                stored_dt = datetime.fromisoformat(stored_at_iso)
-                if stored_dt.tzinfo is None:
-                    stored_dt = stored_dt.replace(tzinfo=timezone.utc)
-                age_days = (datetime.now(timezone.utc) - stored_dt).days
-                if age_days >= self.cvss_cache_ttl_days:
-                    self._delete_cvss_entry(cve_id)
-                    return None
-            except Exception:
-                self._delete_cvss_entry(cve_id)
-                return None
-
-        return data
-
-    async def set_cvss_cached(self, cve_id: str, cvss_info: dict[str, Any]) -> None:
-        now_iso = datetime.now(timezone.utc).isoformat()
-        self.cvss_cache[cve_id] = {"stored_at_iso": now_iso, "data": cvss_info}
-        self._touch_order(self._cvss_order, cve_id)
-        self._prune_dict_by_order(self.cvss_cache, self._cvss_order, self.cvss_cache_max_entries)
-
-    def _delete_cvss_entry(self, cve_id: str) -> None:
-        self.cvss_cache.pop(cve_id, None)
-        try:
-            self._cvss_order.remove(cve_id)
-        except ValueError:
-            pass
-
-    def set_last_catalog_version(self, version: str | None) -> None:
-        self.last_catalog_version = version
-
-    def set_last_fetch_at(self, when_iso: str) -> None:
-        self.last_fetch_at_iso = when_iso
-
-    def set_last_push_at(self, when_iso: str) -> None:
-        self.last_push_at_iso = when_iso
-
-    @staticmethod
-    def _touch_order(order: deque[str], key: str) -> None:
-        if key in order:
-            try:
-                order.remove(key)
-            except ValueError:
-                pass
-        order.append(key)
-
-    @staticmethod
-    def _prune_dict_by_order(d: dict[str, Any], order: deque[str], max_entries: int) -> None:
-        while len(order) > max_entries:
-            old = order.popleft()
-            d.pop(old, None)
-
-    def _prune_all_unsafe(self) -> None:
-        self._prune_dict_by_order(self.pushed_at_by_cve, self._pushed_order, self.state_max_entries)
-        self._prune_dict_by_order(self.seen_at_by_cve, self._seen_order, self.seen_max_entries)
-        self._prune_dict_by_order(self.suppressed_at_by_cve, self._suppressed_order, self.seen_max_entries)
-        self._prune_dict_by_order(self.cvss_cache, self._cvss_order, self.cvss_cache_max_entries)
-
-        for sess, m in list(self.delivered_at_by_session.items()):
-            if not isinstance(m, dict):
-                self.delivered_at_by_session.pop(sess, None)
-                self._delivered_order_by_session.pop(sess, None)
+        逐层手工浅拷贝（不用 copy.deepcopy，状态可能上万条）：json.dump 在 worker
+        线程里只迭代快照自己的容器，所以保存期间其它协程改动活字典不会让 dump 抛出
+        "dictionary changed size during iteration"。
+        """
+        cvss_cache: dict[str, dict[str, Any]] = {}
+        for cve_id, entry in self.cvss_cache.items():
+            if not isinstance(entry, dict):
                 continue
+            payload = entry.get("data")
+            cvss_cache[cve_id] = {
+                "stored_at_iso": entry.get("stored_at_iso"),
+                "data": dict(payload) if isinstance(payload, dict) else payload,
+            }
 
-            order = self._delivered_order_by_session.get(sess)
-            if order is None:
-                items = list(m.items())
-                items.sort(key=lambda kv: kv[1])
-                order = deque([cve for cve, _ in items])
-                self._delivered_order_by_session[sess] = order
+        pending_by_session: dict[str, dict[str, Any]] = {}
+        for session, entry in self.pending_by_session.items():
+            if not isinstance(entry, dict):
+                continue
+            raw_items = entry.get("items")
+            items = (
+                [dict(item) for item in raw_items if isinstance(item, dict)]
+                if isinstance(raw_items, list)
+                else []
+            )
+            pending_by_session[session] = {
+                "attempts": entry.get("attempts"),
+                "items": items,
+            }
 
-            self._prune_dict_by_order(m, order, self.delivered_max_entries_per_session)
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "catalog_version": self.catalog_version,
+            "etag": self.etag,
+            "baseline_cves": dict(self.baseline_cves),
+            "cvss_cache": cvss_cache,
+            "pending_by_session": pending_by_session,
+            "last_fetch_at_iso": self.last_fetch_at_iso,
+            "last_push_at_iso": self.last_push_at_iso,
+        }
+
+    def _write_json_atomic(self, payload: dict[str, Any]) -> None:
+        os.makedirs(self.storage_dir, exist_ok=True)
+        tmp_path = self.state_file_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp_path, self.state_file_path)
+
+    # ------------------------------------------------------------------ 基线
+
+    def select_new_entries(self, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        for entry in entries:
+            cve_id = str(entry.get("cveID") or "").strip()
+            if cve_id and cve_id not in self.baseline_cves:
+                result.append(entry)
+        return result
+
+    def merge_into_baseline(self, entries: list[dict[str, Any]]) -> None:
+        for entry in entries:
+            cve_id = str(entry.get("cveID") or "").strip()
+            if not cve_id:
+                continue
+            date_added = entry.get("dateAdded")
+            self.baseline_cves[cve_id] = date_added.strip() if isinstance(date_added, str) else ""
+
+    def replace_baseline(self, entries: list[dict[str, Any]]) -> None:
+        self.baseline_cves = {}
+        self.merge_into_baseline(entries)
+
+    # ------------------------------------------------------------- CVSS 缓存
+
+    def get_cvss(self, cve_id: str) -> dict[str, Any] | None:
+        """取一条未过期的缓存。
+
+        返回的是内部状态的视图，调用方**不得原地修改**；需要改动请先自行拷贝。
+        条目缺失、时间戳非法或已过 TTL 时返回 None，并顺手把该条目从缓存里剔除。
+        """
+        entry = self.cvss_cache.get(cve_id)
+        if not isinstance(entry, dict):
+            return None
+        if self._cvss_entry_stale(entry.get("stored_at_iso")):
+            self.cvss_cache.pop(cve_id, None)
+            return None
+        payload = entry.get("data")
+        return payload if isinstance(payload, dict) else None
+
+    def set_cvss(self, cve_id: str, data: dict[str, Any]) -> None:
+        """只缓存成功的结果。查询失败不得调用本方法。
+
+        传入的 data 存入后不得再由调用方修改（内部保留的是同一个 dict）。
+        """
+        if not self._cvss_payload_usable(data):
+            return
+        self.cvss_cache[cve_id] = {
+            "stored_at_iso": datetime.now(timezone.utc).isoformat(),
+            "data": data,
+        }
+        self._prune_cvss_cache()
+
+    @staticmethod
+    def _cvss_payload_usable(payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        score = payload.get("cvss_base_score")
+        severity = payload.get("cvss_base_severity")
+        return isinstance(score, (int, float)) or (isinstance(severity, str) and bool(severity.strip()))
+
+    @staticmethod
+    def _cvss_stored_at_valid(stored_at: Any) -> bool:
+        """stored_at_iso 必须是非空字符串；缺失或不合法即视为来源不明，调用方丢弃。"""
+        return isinstance(stored_at, str) and bool(stored_at.strip())
+
+    def _cvss_entry_stale(self, stored_at: Any) -> bool:
+        """时间戳缺失/非法或已过 TTL 时返回 True（不可用）。"""
+        if not self._cvss_stored_at_valid(stored_at):
+            return True
+        try:
+            stored_dt = datetime.fromisoformat(stored_at)
+        except ValueError:
+            return True
+        if stored_dt.tzinfo is None:
+            stored_dt = stored_dt.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - stored_dt).days >= self.cvss_cache_ttl_days
+
+    def _prune_cvss_cache(self) -> None:
+        overflow = len(self.cvss_cache) - CVSS_CACHE_MAX_ENTRIES
+        if overflow <= 0:
+            return
+        ordered = sorted(
+            self.cvss_cache.items(), key=lambda kv: kv[1].get("stored_at_iso") or ""
+        )
+        for cve_id, _ in ordered[:overflow]:
+            self.cvss_cache.pop(cve_id, None)
+
+    # ------------------------------------------------------------ 待补发队列
+
+    def get_pending_blocks(self, session: str) -> list[dict[str, str]]:
+        """取该会话待补发的块列表。
+
+        返回的列表是新建的，但列表里的 item dict 是内部状态的视图，调用方**不得原地修改**。
+        """
+        entry = self.pending_by_session.get(session)
+        if not isinstance(entry, dict):
+            return []
+        items = entry.get("items")
+        if not isinstance(items, list):
+            return []
+        return [item for item in items if isinstance(item, dict)]
+
+    def get_pending_attempts(self, session: str) -> int:
+        entry = self.pending_by_session.get(session)
+        if not isinstance(entry, dict):
+            return 0
+        attempts = entry.get("attempts")
+        return attempts if isinstance(attempts, int) and attempts > 0 else 0
+
+    def record_session_failure(self, session: str, blocks: list[dict[str, str]]) -> bool:
+        """记录一次适配器报错。返回 False 表示已达上限并放弃补发。"""
+        attempts = self.get_pending_attempts(session) + 1
+        if attempts >= PENDING_MAX_ATTEMPTS:
+            self.pending_by_session.pop(session, None)
+            return False
+
+        merged: dict[str, dict[str, str]] = {}
+        for item in self.get_pending_blocks(session) + list(blocks):
+            cve_id = item.get("cve_id")
+            block = item.get("block")
+            if isinstance(cve_id, str) and isinstance(block, str):
+                merged[cve_id] = {"cve_id": cve_id, "block": block}
+
+        items = list(merged.values())
+        if len(items) > PENDING_MAX_ITEMS_PER_SESSION:
+            dropped = items[:-PENDING_MAX_ITEMS_PER_SESSION]
+            items = items[-PENDING_MAX_ITEMS_PER_SESSION:]
+            logger.error(
+                f"[CVE漏洞推送] 会话 {session} 待补发队列超过上限 "
+                f"{PENDING_MAX_ITEMS_PER_SESSION} 条，丢弃最旧 {len(dropped)} 条: "
+                f"{', '.join(str(item.get('cve_id')) for item in dropped)}"
+            )
+        self.pending_by_session[session] = {"attempts": attempts, "items": items}
+        return True
+
+    def clear_pending(self, session: str) -> None:
+        self.pending_by_session.pop(session, None)
+
+    # ------------------------------------------------------------------ 时间戳
+
+    def touch_fetch(self) -> None:
+        self.last_fetch_at_iso = datetime.now(timezone.utc).isoformat()
+
+    def touch_push(self) -> None:
+        self.last_push_at_iso = datetime.now(timezone.utc).isoformat()

@@ -2,23 +2,23 @@
   "enabled": {
     "description": "启用 CVE 推送插件",
     "type": "bool",
-    "hint": "关闭后插件不会启动定时任务。",
+    "hint": "关闭后不会启动定时任务。",
     "default": true
   },
   "admin_users": {
     "description": "插件管理员列表（QQ号等）",
     "type": "list",
-    "hint": "拥有管理权限的用户可执行状态/手动刷新等操作。",
-    "default": null
+    "hint": "拥有管理权限的用户可执行状态/手动刷新操作。留空则只有平台管理员可用。",
+    "default": []
   },
   "target_sessions": {
     "description": "推送会话列表",
     "type": "list",
-    "hint": "格式: {platform_name}:{message_type}:{session_id}，例如 aiocqhttp:GroupMessage:123456789。",
+    "hint": "格式 平台:消息类型:会话ID，例如 aiocqhttp:GroupMessage:123456789。在目标群发 /sid 可获取。",
     "default": []
   },
   "kev_feed_url": {
-    "description": "CISA KEV 公开 JSON 数据源地址",
+    "description": "CISA KEV JSON 数据源地址",
     "type": "string",
     "hint": "不建议修改，除非你有自建镜像。",
     "default": "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
@@ -26,149 +26,54 @@
   "http_proxy": {
     "description": "HTTP 请求代理地址",
     "type": "string",
-    "hint": "用于 KEV/NVD 请求代理，例如 http://127.0.0.1:7890。留空则直连。",
+    "hint": "用于 KEV/NVD 请求，例如 http://127.0.0.1:7890。留空则直连。",
     "default": ""
   },
   "push_interval_hours": {
     "description": "拉取间隔（小时）",
     "type": "int",
-    "hint": "按时间批量发现“新增 KEV CVE”并推送。",
+    "hint": "目录版本未变时几乎零开销，可按需调小。",
     "default": 6,
-    "slider": {
-      "min": 1,
-      "max": 48,
-      "step": 1
-    }
+    "slider": { "min": 1, "max": 48, "step": 1 }
   },
-  "max_push_per_run": {
-    "description": "单次最多推送条目数",
+  "max_items_per_message": {
+    "description": "单条消息最多包含几条 CVE",
     "type": "int",
-    "hint": "防止单次刷新因为网络/服务限制导致推送过多。",
-    "default": 30,
-    "slider": {
-      "min": 1,
-      "max": 200,
-      "step": 1
-    }
-  },
-  "min_date_added": {
-    "description": "最早漏洞加入日期",
-    "type": "string",
-    "hint": "格式: YYYYMMDD，例如 20260605。KEV dateAdded 早于该日期的漏洞不会通知；留空则不限制。",
-    "default": ""
-  },
-  "display_timezone": {
-    "description": "显示时区",
-    "type": "string",
-    "hint": "用于把 KEV 的日期展示为你的本地习惯（不影响推送逻辑）。",
-    "default": "UTC+8"
-  },
-  "enable_low_medium": {
-    "description": "是否推送中危/低危（默认只推 Critical/High）",
-    "type": "bool",
-    "default": false,
-    "hint": "KEV 只包含“已知被利用”的漏洞，但 CVSS 可能是 Medium/Low。开启后也会推送这些条目。"
-  },
-  "kev_fetch_retry_count": {
-    "description": "CISA KEV 拉取失败重试次数",
-    "type": "int",
-    "default": 3,
-    "slider": {
-      "min": 1,
-      "max": 10,
-      "step": 1
-    }
-  },
-  "kev_fetch_retry_interval_seconds": {
-    "description": "CISA KEV 拉取失败重试间隔（秒）",
-    "type": "int",
-    "default": 10,
-    "slider": {
-      "min": 1,
-      "max": 120,
-      "step": 1
-    }
+    "hint": "超出后分屏发送，避免单条消息过长。",
+    "default": 15,
+    "slider": { "min": 1, "max": 50, "step": 1 }
   },
   "failure_notify_sessions": {
-    "description": "初始化/拉取失败通知会话（UMO 列表，可用于通知管理员）",
+    "description": "刷新失败通知会话（UMO 列表）",
     "type": "list",
-    "default": [],
-    "hint": "例如填写 aiocqhttp:FriendMessage:123456 或 GroupMessage:xxx。留空则只写日志。"
-  },
-  "cvss_cache_ttl_days": {
-    "description": "CVSS 缓存过期天数（避免频繁打 NVD）",
-    "type": "int",
-    "default": 30,
-    "slider": {
-      "min": 1,
-      "max": 90,
-      "step": 1
-    }
+    "hint": "仅在拉取/刷新抛异常或 KEV 目录解析异常时通知，发送报错不通知。留空则只写日志。",
+    "default": []
   },
   "nvd_api_key": {
     "description": "NVD API Key（可选）",
     "type": "string",
-    "hint": "用于获取 CVSS 严重等级。留空也会尝试调用，但可能触发更严格的限流。",
+    "hint": "配置后 NVD 限流更宽松。留空也能查，但更容易失败。",
     "default": "",
     "hidden": true
   },
-  "nvd_timeout_seconds": {
-    "description": "NVD 请求超时（秒）",
+  "cvss_cache_ttl_days": {
+    "description": "CVSS 缓存过期天数",
     "type": "int",
-    "default": 12,
-    "slider": {
-      "min": 3,
-      "max": 60,
-      "step": 1
-    }
+    "hint": "过期后重新向 NVD 查询。",
+    "default": 30,
+    "slider": { "min": 1, "max": 90, "step": 1 }
   },
-  "message_format": {
-    "description": "消息展示策略",
-    "type": "object",
-    "hint": "Critical/High 使用详细格式，Medium/Low 使用简略格式。",
-    "items": {
-      "critical_high_detailed": {
-        "description": "Critical/High 是否使用详细格式",
-        "type": "bool",
-        "default": true
-      },
-      "short_description_max_len": {
-        "description": "KEV shortDescription 最大长度（超过将截断）",
-        "type": "int",
-        "default": 220,
-        "slider": {
-          "min": 50,
-          "max": 1000,
-          "step": 10
-        }
-      },
-      "include_cwe": {
-        "description": "在详细格式中包含 CWE 信息（来自 NVD）",
-        "type": "bool",
-        "default": true
-      }
-    }
+  "enable_ai_summary": {
+    "description": "用 AstrBot 已配置的模型生成中文摘要",
+    "type": "bool",
+    "hint": "关闭后直接使用 KEV 英文原文（截断 120 字）。模型不可用时自动降级，不影响推送。",
+    "default": true
   },
-  "dedup": {
-    "description": "去重与推送策略",
-    "type": "object",
-    "hint": "默认仅推送“新加入 KEV 的 CVE”。",
-    "items": {
-      "push_only_new": {
-        "description": "只推送从未推送过的 CVE",
-        "type": "bool",
-        "default": true
-      },
-      "state_max_entries": {
-        "description": "状态文件内允许的最大去重条目数（用于防止无限增长，超过后会丢弃最旧条目）",
-        "type": "int",
-        "default": 5000,
-        "slider": {
-          "min": 100,
-          "max": 50000,
-          "step": 100
-        }
-      }
-    }
+  "summary_timeout_seconds": {
+    "description": "AI 摘要超时（秒）",
+    "type": "int",
+    "hint": "超时即降级为英文原文，不阻塞推送。",
+    "default": 60,
+    "slider": { "min": 10, "max": 180, "step": 5 }
   }
 }
